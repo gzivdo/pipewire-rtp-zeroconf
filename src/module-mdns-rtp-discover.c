@@ -24,8 +24,11 @@
 
 #include <avahi-client/client.h>
 #include <avahi-client/lookup.h>
+#include <avahi-client/publish.h>
 #include <avahi-common/error.h>
 #include <avahi-common/malloc.h>
+#include <avahi-common/alternative.h>
+#include <avahi-common/domain.h>
 
 #include <pipewire/extensions/metadata.h>
 
@@ -103,6 +106,15 @@ struct peer_card {
 
 	struct spa_list tunnels;   /* of struct tunnel via tunnel::link */
 	struct peer_device *device;
+
+	/* When the user picks an Input profile for this card AND the peer
+	 * publishes its source-direction as unicast, we publish a
+	 * back-channel request via Avahi so the speaker knows to start
+	 * sending. The request stays up until the profile leaves Input. */
+	AvahiEntryGroup *req_entry_group;
+	uint16_t req_port;            /* local UDP port advertised in request */
+	char req_service_name[128];
+	int req_collision_count;
 };
 
 struct meta_entry {
@@ -140,6 +152,9 @@ struct impl {
 
 	double   ptime_ms;
 	uint32_t latency_ms;
+
+	char host_name[256];
+	uint16_t req_next_port;    /* port-pool head for back-channel requests */
 
 	struct spa_list tunnels;  /* flat list, impl_link */
 	struct spa_list cards;    /* of struct peer_card */
@@ -276,6 +291,135 @@ static void tunnel_set_loaded(struct tunnel *t, bool loaded)
 	}
 }
 
+/* -- Avahi request-record (Stage 24b unicast back-channel) ---------- */
+
+static void req_entry_group_cb(AvahiEntryGroup *g, AvahiEntryGroupState state,
+			       void *userdata)
+{
+	struct peer_card *c = userdata;
+	switch (state) {
+	case AVAHI_ENTRY_GROUP_ESTABLISHED:
+		pw_log_info("request '%s' established", c->req_service_name);
+		break;
+	case AVAHI_ENTRY_GROUP_COLLISION: {
+		char *alt = avahi_alternative_service_name(c->req_service_name);
+		if (alt) {
+			snprintf(c->req_service_name, sizeof(c->req_service_name),
+				 "%s", alt);
+			avahi_free(alt);
+			if (++c->req_collision_count < 8) {
+				avahi_entry_group_reset(g);
+				/* re-add deferred — caller will republish */
+			}
+		}
+		break;
+	}
+	case AVAHI_ENTRY_GROUP_FAILURE:
+		pw_log_error("request entry group failure: %s",
+			     avahi_strerror(avahi_client_errno(
+					     avahi_entry_group_get_client(g))));
+		break;
+	default:
+		break;
+	}
+}
+
+static int card_publish_request(struct peer_card *c)
+{
+	struct impl *impl = c->impl;
+
+	if (impl->avahi_client == NULL ||
+	    avahi_client_get_state(impl->avahi_client) != AVAHI_CLIENT_S_RUNNING)
+		return 0;
+
+	if (c->req_entry_group != NULL)
+		return 0;  /* already up */
+
+	if (c->req_port == 0)
+		c->req_port = impl->req_next_port++;
+
+	snprintf(c->req_service_name, sizeof(c->req_service_name),
+		 "%.20s: req %.20s:%.20s", impl->host_name,
+		 c->peer_host, c->card_name);
+
+	c->req_entry_group = avahi_entry_group_new(impl->avahi_client,
+						   req_entry_group_cb, c);
+	if (c->req_entry_group == NULL) {
+		pw_log_error("avahi_entry_group_new (req): %s",
+			     avahi_strerror(avahi_client_errno(impl->avahi_client)));
+		return -1;
+	}
+
+	AvahiStringList *t = NULL;
+	char buf[32];
+	t = avahi_string_list_add_pair(t, PWNZ_TXT_HOST, impl->host_name);
+	t = avahi_string_list_add_pair(t, PWNZ_TXT_TARGET_HOST, c->peer_host);
+	t = avahi_string_list_add_pair(t, PWNZ_TXT_TARGET_CARD, c->card_name);
+	snprintf(buf, sizeof(buf), "%u", impl->latency_ms);
+	t = avahi_string_list_add_pair(t, "latency-msec", buf);
+
+	int err = avahi_entry_group_add_service_strlst(
+		c->req_entry_group,
+		AVAHI_IF_UNSPEC, AVAHI_PROTO_UNSPEC, 0,
+		c->req_service_name,
+		PWNZ_REQUEST_SERVICE_TYPE,
+		NULL, NULL, c->req_port, t);
+	avahi_string_list_free(t);
+	if (err < 0) {
+		pw_log_error("avahi_entry_group_add_service (req): %s",
+			     avahi_strerror(err));
+		avahi_entry_group_free(c->req_entry_group);
+		c->req_entry_group = NULL;
+		return -1;
+	}
+	if ((err = avahi_entry_group_commit(c->req_entry_group)) < 0) {
+		pw_log_error("avahi_entry_group_commit (req): %s",
+			     avahi_strerror(err));
+		avahi_entry_group_free(c->req_entry_group);
+		c->req_entry_group = NULL;
+		return -1;
+	}
+	pw_log_info("published request '%s' port=%u (asking %s:%s)",
+		    c->req_service_name, c->req_port, c->peer_host, c->card_name);
+	return 0;
+}
+
+static void card_withdraw_request(struct peer_card *c)
+{
+	if (c->req_entry_group) {
+		avahi_entry_group_free(c->req_entry_group);
+		c->req_entry_group = NULL;
+		pw_log_info("withdrew request '%s'", c->req_service_name);
+	}
+}
+
+/* Should this card maintain an outgoing request right now? Only if
+ * Input direction is active AND at least one source-mode tunnel uses
+ * unicast transport (peer's announcement). */
+static bool card_needs_request(struct peer_card *c)
+{
+	uint32_t active = c->device ? peer_device_get_active_dirs(c->device) : 0;
+	if (!(active & PEER_DIR_INPUT))
+		return false;
+	struct tunnel *t;
+	spa_list_for_each(t, &c->tunnels, link) {
+		if (t->is_sink_mode)
+			continue;
+		bool is_mc = t->transport && spa_streq(t->transport, "multicast");
+		if (!is_mc)
+			return true;
+	}
+	return false;
+}
+
+static void card_update_request(struct peer_card *c)
+{
+	if (card_needs_request(c))
+		card_publish_request(c);
+	else
+		card_withdraw_request(c);
+}
+
 /* Called by peer_device when the user picks a new profile via
  * pavucontrol / pw-cli set-param. active_dirs is the bitmask of the
  * directions the user wants on: 0 = Off, OUTPUT = playback only,
@@ -293,6 +437,7 @@ static int card_profile_cb(void *user_data, uint32_t active_dirs)
 		uint32_t need = t->is_sink_mode ? PEER_DIR_OUTPUT : PEER_DIR_INPUT;
 		tunnel_set_loaded(t, (active_dirs & need) != 0);
 	}
+	card_update_request(c);
 	return 0;
 }
 
@@ -640,6 +785,10 @@ static void resolver_cb(AvahiServiceResolver *r,
 		tunnel_set_loaded(t, true);
 	}
 
+	/* Publish/withdraw the unicast back-channel request based on
+	 * whether the active profile asks for the peer's mic. */
+	card_update_request(card);
+
 done:
 	txt_kv_free(&kv);
 	avahi_service_resolver_free(r);
@@ -732,6 +881,7 @@ static void peer_card_free(struct peer_card *c)
 {
 	if (c == NULL)
 		return;
+	card_withdraw_request(c);
 	struct tunnel *t;
 	spa_list_consume(t, &c->tunnels, link) {
 		t->card = NULL;          /* prevent recursion via tunnel_free */
@@ -1035,9 +1185,14 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	impl->context = context;
 	impl->props = props;
 	impl->metadata_id = SPA_ID_INVALID;
+	impl->req_next_port = PWNZ_DEFAULT_PORT_BASE + PWNZ_DEFAULT_PORT_RANGE;
 	spa_list_init(&impl->tunnels);
 	spa_list_init(&impl->cards);
 	spa_list_init(&impl->meta_entries);
+
+	if (gethostname(impl->host_name, sizeof(impl->host_name)) < 0)
+		snprintf(impl->host_name, sizeof(impl->host_name), "pipewire");
+	impl->host_name[sizeof(impl->host_name) - 1] = '\0';
 
 	impl->discover_sink   = pw_properties_get_bool(props, "discover.sink",   true);
 	impl->discover_source = pw_properties_get_bool(props, "discover.source", false);

@@ -28,6 +28,7 @@
 
 #include <avahi-client/client.h>
 #include <avahi-client/publish.h>
+#include <avahi-client/lookup.h>
 #include <avahi-common/error.h>
 #include <avahi-common/malloc.h>
 #include <avahi-common/alternative.h>
@@ -108,6 +109,20 @@ struct meta_entry {
 	bool enabled;
 };
 
+/* One subscriber that asked us (via mDNS request-record) to stream a
+ * specific local mic card to it over unicast. We load one rtp-sink per
+ * incoming_request, destination = requester's resolved IP+port. */
+struct incoming_request {
+	struct spa_list link;
+	struct impl *impl;
+	char *avahi_name;
+	char *target_card;
+	char *requester_addr;
+	uint16_t requester_port;
+	struct pw_impl_module *rtp_sink_mod;
+	struct spa_hook rtp_sink_listener;
+};
+
 struct impl {
 	struct pw_context *context;
 	struct pw_impl_module *module;
@@ -130,6 +145,8 @@ struct impl {
 
 	AvahiPoll *avahi_poll;
 	AvahiClient *avahi_client;
+	AvahiServiceBrowser *req_browser;
+	struct spa_list incoming_requests;
 
 	char host_name[HOST_NAME_MAX + 1];
 
@@ -168,6 +185,56 @@ static void service_free(struct service *s);
 static int publish_service(struct service *s);
 static void unpublish_service(struct service *s);
 static void service_apply_state(struct service *s);
+
+static struct service *find_service_by_card_name(struct impl *impl, const char *card)
+{
+	struct service *s;
+	spa_list_for_each(s, &impl->services, link)
+		if (s->card_name && spa_streq(s->card_name, card) && !s->is_sink)
+			return s;
+	return NULL;
+}
+
+static struct incoming_request *find_request_by_name(struct impl *impl,
+						     const char *name)
+{
+	struct incoming_request *r;
+	spa_list_for_each(r, &impl->incoming_requests, link)
+		if (spa_streq(r->avahi_name, name))
+			return r;
+	return NULL;
+}
+
+static void incoming_request_unload(struct incoming_request *r)
+{
+	if (r->rtp_sink_mod) {
+		spa_hook_remove(&r->rtp_sink_listener);
+		pw_impl_module_destroy(r->rtp_sink_mod);
+		r->rtp_sink_mod = NULL;
+	}
+}
+
+static void incoming_request_free(struct incoming_request *r)
+{
+	spa_list_remove(&r->link);
+	incoming_request_unload(r);
+	free(r->avahi_name);
+	free(r->target_card);
+	free(r->requester_addr);
+	free(r);
+}
+
+static void req_rtp_mod_destroyed(void *data)
+{
+	struct incoming_request *r = data;
+	spa_hook_remove(&r->rtp_sink_listener);
+	r->rtp_sink_mod = NULL;
+}
+
+static const struct pw_impl_module_events req_rtp_mod_events = {
+	PW_VERSION_IMPL_MODULE_EVENTS,
+	.destroy = req_rtp_mod_destroyed,
+};
 
 /* -- metadata cache --------------------------------------------------- */
 
@@ -543,15 +610,12 @@ static int load_local_endpoint(struct service *s)
 	char pbuf[32];
 	spa_dtoa(pbuf, sizeof(pbuf), impl->ptime_ms);
 
-	/* Unicast source-direction needs the request-record back-channel to
-	 * know where to send; without it we have no destination. Skip with
-	 * a warning until Stage 24b lands. */
-	if (!s->is_sink && !impl->multicast) {
-		pw_log_warn("source-direction '%s' needs publish.transport=multicast "
-			    "in this version; unicast source via request-record "
-			    "is not yet implemented", s->node_name);
-		return -ENOTSUP;
-	}
+	/* Unicast source-direction: nothing to load up-front. The Avahi
+	 * service is still published (so discover hosts can find this
+	 * mic), and an rtp-sink will be created lazily per incoming
+	 * request — see req_browser_cb / load_rtp_sink_for_request. */
+	if (!s->is_sink && !impl->multicast)
+		return 0;
 
 	if ((f = open_memstream(&args, &size)) == NULL)
 		return -errno;
@@ -882,6 +946,183 @@ static void service_free(struct service *s)
 	free(s);
 }
 
+/* -- back-channel: serve incoming requests ---------------------------- */
+
+static int load_rtp_sink_for_request(struct incoming_request *r,
+				     struct service *s)
+{
+	struct impl *impl = r->impl;
+	FILE *f;
+	char *args;
+	size_t size;
+	char pbuf[32];
+	spa_dtoa(pbuf, sizeof(pbuf), impl->ptime_ms);
+
+	if ((f = open_memstream(&args, &size)) == NULL)
+		return -errno;
+
+	fprintf(f, "{ ");
+	fprintf(f, "destination.ip = \"%s\" ", r->requester_addr);
+	fprintf(f, "destination.port = %u ", r->requester_port);
+	fprintf(f, "sess.media = \"%s\" ",
+		spa_streq(impl->codec, "opus") ? "opus" : "audio");
+	fprintf(f, "audio.format = \"%s\" ", impl->format);
+	fprintf(f, "audio.rate = %u ", impl->rate);
+	fprintf(f, "audio.channels = %u ", s->channels);
+	fprintf(f, "sess.latency.msec = %u ", impl->latency_ms);
+	fprintf(f, "stream.props = { ");
+	fprintf(f, "node.network = true ");
+	fprintf(f, "media.class = \"Stream/Input/Audio\" ");
+	fprintf(f, "node.target = \"%s\" ", s->node_name);
+	fprintf(f, "node.description = \"net-tx (req) %s\" ", s->node_name);
+	fprintf(f, "rtp.ptime = %s ", pbuf);
+	fprintf(f, "} }");
+	fclose(f);
+
+	pw_log_debug("loading rtp-sink for request: %s", args);
+	r->rtp_sink_mod = pw_context_load_module(impl->context,
+						 "libpipewire-module-rtp-sink",
+						 args, NULL);
+	free(args);
+	if (r->rtp_sink_mod == NULL) {
+		pw_log_error("failed to load rtp-sink for request '%s': %m",
+			     r->avahi_name);
+		return -errno;
+	}
+	pw_impl_module_add_listener(r->rtp_sink_mod, &r->rtp_sink_listener,
+				    &req_rtp_mod_events, r);
+	return 0;
+}
+
+static void req_resolver_cb(AvahiServiceResolver *res,
+			    AvahiIfIndex iface SPA_UNUSED,
+			    AvahiProtocol proto SPA_UNUSED,
+			    AvahiResolverEvent event,
+			    const char *name,
+			    const char *type SPA_UNUSED,
+			    const char *domain SPA_UNUSED,
+			    const char *host_name SPA_UNUSED,
+			    const AvahiAddress *a,
+			    uint16_t port,
+			    AvahiStringList *txt,
+			    AvahiLookupResultFlags flags SPA_UNUSED,
+			    void *userdata)
+{
+	struct impl *impl = userdata;
+	struct incoming_request *r = NULL;
+	char addr_buf[AVAHI_ADDRESS_STR_MAX];
+	char *target_host = NULL, *target_card = NULL;
+
+	if (event != AVAHI_RESOLVER_FOUND) {
+		pw_log_warn("req resolve '%s' failed: %s", name,
+			    avahi_strerror(avahi_client_errno(impl->avahi_client)));
+		goto done;
+	}
+
+	for (AvahiStringList *l = txt; l; l = l->next) {
+		char *key = NULL, *value = NULL;
+		if (avahi_string_list_get_pair(l, &key, &value, NULL) != 0) {
+			avahi_free(key); avahi_free(value); break;
+		}
+		if (spa_streq(key, PWNZ_TXT_TARGET_HOST))      { avahi_free(target_host); target_host = value; value = NULL; }
+		else if (spa_streq(key, PWNZ_TXT_TARGET_CARD)) { avahi_free(target_card); target_card = value; value = NULL; }
+		avahi_free(key); avahi_free(value);
+	}
+
+	if (target_host == NULL || target_card == NULL) {
+		pw_log_warn("request '%s' missing target-host/target-card TXT",
+			    name);
+		goto done;
+	}
+
+	if (!spa_streq(target_host, impl->host_name)) {
+		pw_log_debug("request '%s' targets '%s' (not us)", name, target_host);
+		goto done;
+	}
+
+	struct service *s = find_service_by_card_name(impl, target_card);
+	if (s == NULL) {
+		pw_log_info("request '%s' targets card '%s' we don't publish — skipping",
+			    name, target_card);
+		goto done;
+	}
+
+	r = find_request_by_name(impl, name);
+	if (r == NULL) {
+		r = calloc(1, sizeof(*r));
+		if (r == NULL)
+			goto done;
+		r->impl = impl;
+		r->avahi_name = strdup(name);
+		spa_list_append(&impl->incoming_requests, &r->link);
+	}
+	free(r->target_card);
+	r->target_card = strdup(target_card);
+	avahi_address_snprint(addr_buf, sizeof(addr_buf), a);
+	free(r->requester_addr);
+	r->requester_addr = strdup(addr_buf);
+	r->requester_port = port;
+
+	if (r->rtp_sink_mod == NULL) {
+		pw_log_info("serving request '%s' → mic '%s' to %s:%u",
+			    name, s->card_name, r->requester_addr, r->requester_port);
+		load_rtp_sink_for_request(r, s);
+	}
+
+done:
+	avahi_free(target_host);
+	avahi_free(target_card);
+	avahi_service_resolver_free(res);
+}
+
+static void req_browser_cb(AvahiServiceBrowser *b SPA_UNUSED,
+			   AvahiIfIndex iface, AvahiProtocol proto,
+			   AvahiBrowserEvent event,
+			   const char *name, const char *type, const char *domain,
+			   AvahiLookupResultFlags flags SPA_UNUSED,
+			   void *userdata)
+{
+	struct impl *impl = userdata;
+	switch (event) {
+	case AVAHI_BROWSER_NEW:
+		pw_log_debug("REQ BROWSER_NEW '%s'", name);
+		if (find_request_by_name(impl, name) != NULL)
+			return;
+		if (!avahi_service_resolver_new(impl->avahi_client,
+						iface, proto, name, type, domain,
+						AVAHI_PROTO_UNSPEC, 0,
+						req_resolver_cb, impl)) {
+			pw_log_error("avahi_service_resolver_new (req): %s",
+				     avahi_strerror(avahi_client_errno(impl->avahi_client)));
+		}
+		break;
+	case AVAHI_BROWSER_REMOVE: {
+		pw_log_debug("REQ BROWSER_REMOVE '%s'", name);
+		struct incoming_request *r = find_request_by_name(impl, name);
+		if (r)
+			incoming_request_free(r);
+		break;
+	}
+	default:
+		break;
+	}
+}
+
+static int start_req_browser(struct impl *impl)
+{
+	if (impl->req_browser != NULL)
+		return 0;
+	impl->req_browser = avahi_service_browser_new(
+		impl->avahi_client, AVAHI_IF_UNSPEC, AVAHI_PROTO_UNSPEC,
+		PWNZ_REQUEST_SERVICE_TYPE, NULL, 0, req_browser_cb, impl);
+	if (impl->req_browser == NULL) {
+		pw_log_error("avahi_service_browser_new (req): %s",
+			     avahi_strerror(avahi_client_errno(impl->avahi_client)));
+		return -EIO;
+	}
+	return 0;
+}
+
 /* -- Avahi client state ------------------------------------------------ */
 
 static void avahi_client_cb(AvahiClient *c, AvahiClientState state, void *userdata)
@@ -895,6 +1136,7 @@ static void avahi_client_cb(AvahiClient *c, AvahiClientState state, void *userda
 	case AVAHI_CLIENT_S_RUNNING:
 		pw_log_info("Avahi daemon up");
 		republish_all(impl);
+		start_req_browser(impl);
 		break;
 	case AVAHI_CLIENT_S_COLLISION:
 		pw_log_warn("Avahi host name collision");
@@ -966,11 +1208,19 @@ static void impl_free(struct impl *impl)
 {
 	struct service *s;
 	struct meta_entry *e;
+	struct incoming_request *r;
 
+	spa_list_consume(r, &impl->incoming_requests, link)
+		incoming_request_free(r);
 	spa_list_consume(s, &impl->services, link)
 		service_free(s);
 	spa_list_consume(e, &impl->meta_entries, link)
 		meta_entry_free(e);
+
+	if (impl->req_browser) {
+		avahi_service_browser_free(impl->req_browser);
+		impl->req_browser = NULL;
+	}
 
 	if (impl->metadata) {
 		spa_hook_remove(&impl->metadata_listener);
@@ -1049,6 +1299,7 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	impl->metadata_id = SPA_ID_INVALID;
 	spa_list_init(&impl->services);
 	spa_list_init(&impl->meta_entries);
+	spa_list_init(&impl->incoming_requests);
 
 	if (gethostname(impl->host_name, sizeof(impl->host_name)) < 0)
 		snprintf(impl->host_name, sizeof(impl->host_name), "pipewire");

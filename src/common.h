@@ -4,8 +4,18 @@
 
 #include <stdint.h>
 
-/* Avahi service type for pipewire-net-zeroconf RTP audio. */
+/* Avahi service type for pipewire-net-zeroconf RTP audio announcements. */
 #define PWNZ_SERVICE_TYPE "_pipewire-rtp._udp"
+
+/* Avahi service type for unicast back-channel requests. A discover host
+ * publishes this when it wants to subscribe to a remote mic over
+ * unicast; the publishing host browses for matching requests and loads
+ * one rtp-sink per requester to send the audio. */
+#define PWNZ_REQUEST_SERVICE_TYPE "_pipewire-rtp-req._udp"
+
+/* Request-only TXT keys (added to the standard keys). */
+#define PWNZ_TXT_TARGET_HOST  "target-host"   /* host of the speaker we want from */
+#define PWNZ_TXT_TARGET_CARD  "target-card"   /* card-name on that speaker */
 
 /* TXT keys exchanged between publish and discover. */
 #define PWNZ_TXT_NODE_NAME    "node-name"
