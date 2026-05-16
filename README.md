@@ -296,6 +296,39 @@ the conf-file to use the policy you want at boot. A persistent metadata
 store (similar to WirePlumber's `restore-stream`) is a candidate for a
 future iteration.
 
+## pavucontrol Card view (experimental)
+
+Each discovered remote card is also exposed as a native PipeWire
+`Audio/Device` with `device.api = network-rtp` and an Off/On
+`SPA_PARAM_EnumProfile`. WirePlumber picks the device up automatically,
+so on most desktops the peer cards show up in pavucontrol's
+**Configuration** tab right next to local cards, in the
+GNOME / KDE sound panels, and in `wpctl status`.
+
+What works today:
+
+- The device appears with the right description (`Network: <peer-host>:
+  <card-description>`).
+- `pw-cli enum-params <device-id> EnumProfile` lists the Off/On
+  profiles we publish, plus whatever WirePlumber's policy adds on top.
+
+What is not wired yet (deferred):
+
+- A Profile change applied via pavucontrol's dropdown does not
+  currently round-trip through to our `impl_set_param` callback because
+  WirePlumber owns the policy decision for `Audio/Device` nodes and
+  doesn't forward unknown profile classes to the SPA implementation.
+  Use the [runtime metadata toggle](#runtime-toggles-via-metadata) for
+  enable/disable until the WP-side hook lands.
+- Profile change does not yet emit `spa_device_object_info` events to
+  let WP own the child sink/source nodes the way it does for ALSA
+  cards; the rtp-sink module is loaded by us directly as a separate
+  PipeWire module.
+
+Both gaps will close once the device emits proper per-profile
+`object_info` events and the WP `policy-device.lua` rules learn the
+`network-rtp` device class. Tracked for a follow-up.
+
 ## Tuning
 
 Defaults are chosen so it just works on a normal home LAN with 1500-byte

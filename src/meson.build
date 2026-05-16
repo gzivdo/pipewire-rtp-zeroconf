@@ -1,5 +1,6 @@
 common_sources = files(
   'avahi-poll.c',
+  'peer-device.c',
 )
 
 common_inc = include_directories('.')

@@ -31,6 +31,7 @@
 
 #include "avahi-poll.h"
 #include "common.h"
+#include "peer-device.h"
 
 /* Metadata key prefix for runtime per-peer-card toggles.
  *   pipewire-net-zeroconf.discover.<peer-host>.<peer-node>.enabled = "true"|"false"
@@ -84,6 +85,9 @@ struct tunnel {
 
 	struct pw_impl_module *rtp_mod;
 	struct spa_hook rtp_mod_listener;
+
+	/* Per-card SPA Device exposing Off/On profile. */
+	struct peer_device *device;
 };
 
 struct meta_entry {
@@ -225,14 +229,16 @@ static void unload_local_endpoint(struct tunnel *t)
 	}
 }
 
-static void tunnel_apply_state(struct tunnel *t)
+/* Bring the rtp child module into the requested state without touching
+ * the SPA-device profile. Used by both the profile callback and the
+ * metadata-change handler — whichever path comes first wins, the other
+ * sees this as a no-op. */
+static void tunnel_set_loaded(struct tunnel *t, bool loaded)
 {
-	bool want = is_enabled(t->impl, t->peer_host, t->peer_node);
 	bool have = t->rtp_mod != NULL;
-	if (want == have)
+	if (loaded == have)
 		return;
-	if (want) {
-		pw_log_info("enabling '%s' via metadata", t->avahi_name);
+	if (loaded) {
 		if (t->peer_addr)
 			load_local_endpoint(t, t->peer_addr, t->peer_port,
 					    t->rate, t->channels, t->format,
@@ -240,8 +246,32 @@ static void tunnel_apply_state(struct tunnel *t)
 					    t->transport, t->multicast_ip,
 					    t->multicast_ttl);
 	} else {
-		pw_log_info("disabling '%s' via metadata", t->avahi_name);
 		unload_local_endpoint(t);
+	}
+}
+
+/* Called by peer_device when the user picks a new profile via
+ * pavucontrol / pw-cli set-param. Just (un)load the rtp module. */
+static int tunnel_profile_cb(void *user_data, bool on)
+{
+	struct tunnel *t = user_data;
+	pw_log_info("profile change for '%s' → %s", t->avahi_name,
+		    on ? "On" : "Off");
+	tunnel_set_loaded(t, on);
+	return 0;
+}
+
+static void tunnel_apply_state(struct tunnel *t)
+{
+	bool want = is_enabled(t->impl, t->peer_host, t->peer_node);
+	/* Drive through the SPA Device so pavucontrol and metadata stay
+	 * coherent (peer_device_set_profile is a no-op if already in the
+	 * target state, and otherwise re-invokes tunnel_profile_cb which
+	 * actually loads/unloads). */
+	if (t->device) {
+		peer_device_set_profile(t->device, want);
+	} else {
+		tunnel_set_loaded(t, want);
 	}
 }
 
@@ -478,6 +508,34 @@ static void resolver_cb(AvahiServiceResolver *r,
 
 	avahi_address_snprint(addr_buf, sizeof(addr_buf), a);
 
+	/* Create the SPA Device on first sighting so pavucontrol shows the
+	 * peer card in the Configuration tab with an Off/On profile. */
+	if (t->device == NULL) {
+		char node_name[256];
+		char *peer_host_safe = sanitize_for_node_name(t->peer_host);
+		char *peer_node_safe = sanitize_for_node_name(t->peer_node);
+		snprintf(node_name, sizeof(node_name), "network.%s.%s",
+			 peer_host_safe ? peer_host_safe : t->peer_host,
+			 peer_node_safe ? peer_node_safe : t->peer_node);
+		free(peer_host_safe);
+		free(peer_node_safe);
+
+		char description[512];
+		snprintf(description, sizeof(description), "Network: %s: %s",
+			 t->peer_host, kv.description ? kv.description : kv.node_name);
+
+		struct peer_device_info pdi = {
+			.node_name        = node_name,
+			.node_description = description,
+			.peer_host        = t->peer_host,
+			.default_on       = is_enabled(impl, t->peer_host, t->peer_node),
+		};
+		t->device = peer_device_new(impl->context, &pdi,
+					    tunnel_profile_cb, t);
+		if (t->device == NULL)
+			pw_log_warn("peer_device_new failed for '%s': %m", name);
+	}
+
 	/* Cache resolution payload so the metadata-toggle path can re-load
 	 * later. Old values freed first. */
 	#define REPLACE_OPT(field, src) do { free(t->field); t->field = (src) ? strdup(src) : NULL; } while (0)
@@ -496,10 +554,7 @@ static void resolver_cb(AvahiServiceResolver *r,
 	t->peer_port = port;
 
 	if (is_enabled(impl, t->peer_host, t->peer_node)) {
-		load_local_endpoint(t, t->peer_addr, t->peer_port,
-				    t->rate, t->channels, t->format, t->codec,
-				    t->description, t->transport,
-				    t->multicast_ip, t->multicast_ttl);
+		tunnel_set_loaded(t, true);
 	} else {
 		pw_log_info("'%s' disabled by metadata — not loading", name);
 	}
@@ -559,6 +614,10 @@ static void tunnel_free(struct tunnel *t)
 {
 	spa_list_remove(&t->link);
 	unload_local_endpoint(t);
+	if (t->device) {
+		peer_device_destroy(t->device);
+		t->device = NULL;
+	}
 	free(t->avahi_name);
 	free(t->peer_host);
 	free(t->peer_node);
