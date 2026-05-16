@@ -32,8 +32,20 @@
 #include <avahi-common/alternative.h>
 #include <avahi-common/domain.h>
 
+#include <pipewire/extensions/metadata.h>
+
 #include "avahi-poll.h"
 #include "common.h"
+
+/* Metadata key prefix for runtime per-card toggles.
+ *   pipewire-net-zeroconf.publish.<node-name>.enabled = "true" | "false"
+ * Subject = 0 (PW_ID_CORE). Default (key absent) = enabled.
+ * Set / clear via standard tooling, e.g.:
+ *   pw-metadata 0 "pipewire-net-zeroconf.publish.alsa_output.pci-0000_00_1f.3.analog-stereo.enabled" "false"
+ *   pw-metadata -d 0 "pipewire-net-zeroconf.publish.alsa_output.pci-0000_00_1f.3.analog-stereo.enabled"
+ */
+#define PWNZ_META_PREFIX  "pipewire-net-zeroconf.publish."
+#define PWNZ_META_SUFFIX  ".enabled"
 
 #define NAME "mdns-rtp-publish"
 
@@ -87,6 +99,12 @@ struct service {
 	struct spa_hook rtp_mod_listener;
 };
 
+struct meta_entry {
+	struct spa_list link;
+	char *node_name;     /* part between PREFIX and SUFFIX */
+	bool enabled;
+};
+
 struct impl {
 	struct pw_context *context;
 	struct pw_impl_module *module;
@@ -100,6 +118,12 @@ struct impl {
 
 	struct pw_registry *registry;
 	struct spa_hook registry_listener;
+
+	/* "default" metadata for runtime toggle keys. */
+	struct pw_proxy *metadata;
+	struct spa_hook metadata_listener;
+	uint32_t metadata_id;
+	struct spa_list meta_entries;
 
 	AvahiPoll *avahi_poll;
 	AvahiClient *avahi_client;
@@ -138,6 +162,41 @@ struct impl {
 static int start_avahi_client(struct impl *impl);
 static void service_free(struct service *s);
 static int publish_service(struct service *s);
+static void unpublish_service(struct service *s);
+static void service_apply_state(struct service *s);
+
+/* -- metadata cache --------------------------------------------------- */
+
+static struct meta_entry *meta_find(struct impl *impl, const char *node_name)
+{
+	struct meta_entry *e;
+	spa_list_for_each(e, &impl->meta_entries, link)
+		if (spa_streq(e->node_name, node_name))
+			return e;
+	return NULL;
+}
+
+static bool is_enabled(struct impl *impl, const char *node_name)
+{
+	struct meta_entry *e = meta_find(impl, node_name);
+	return e == NULL ? true : e->enabled;
+}
+
+static void meta_entry_free(struct meta_entry *e)
+{
+	spa_list_remove(&e->link);
+	free(e->node_name);
+	free(e);
+}
+
+static struct service *find_service_by_node_name(struct impl *impl, const char *name)
+{
+	struct service *s;
+	spa_list_for_each(s, &impl->services, link)
+		if (spa_streq(s->node_name, name))
+			return s;
+	return NULL;
+}
 
 static int allocate_port(struct impl *impl, uint16_t *out_port)
 {
@@ -214,10 +273,23 @@ static bool should_publish(struct impl *impl, const struct spa_dict *props,
 		return false;
 	if (node_network && spa_atob(node_network))
 		return false;
+	/* Skip our own discover-side virtual sinks (they start with
+	 * "network." per discover's deterministic node.name). Otherwise
+	 * a single-host test setup chains forever. */
+	if (strncmp(node_name, "network.", 8) == 0)
+		return false;
 
 	*is_sink_out = is_sink;
 	return true;
 }
+
+static int meta_property(void *data, uint32_t subject, const char *key,
+			 const char *type SPA_UNUSED, const char *value);
+
+static const struct pw_metadata_events metadata_events = {
+	PW_VERSION_METADATA_EVENTS,
+	.property = meta_property,
+};
 
 static void registry_global(void *data, uint32_t id,
 			    uint32_t permissions SPA_UNUSED,
@@ -227,6 +299,24 @@ static void registry_global(void *data, uint32_t id,
 {
 	struct impl *impl = data;
 	bool is_sink;
+
+	/* Bind the default metadata once we see it in the registry. */
+	if (spa_streq(type, PW_TYPE_INTERFACE_Metadata)) {
+		if (impl->metadata != NULL || props == NULL)
+			return;
+		if (!spa_streq(spa_dict_lookup(props, "metadata.name"), "default"))
+			return;
+		impl->metadata = pw_registry_bind(impl->registry, id, type,
+						  PW_VERSION_METADATA, 0);
+		if (impl->metadata == NULL)
+			return;
+		impl->metadata_id = id;
+		pw_metadata_add_listener((struct pw_metadata *) impl->metadata,
+					 &impl->metadata_listener,
+					 &metadata_events, impl);
+		pw_log_info("bound default metadata id=%u", id);
+		return;
+	}
 
 	if (!spa_streq(type, PW_TYPE_INTERFACE_Node))
 		return;
@@ -280,20 +370,92 @@ static void registry_global(void *data, uint32_t id,
 
 	spa_list_append(&impl->services, &s->link);
 
-	pw_log_info("tracking node id=%u name=%s desc='%s' channels=%u port=%u",
-		    id, node_name, desc, channels, s->port);
+	pw_log_info("tracking node id=%u name=%s desc='%s' channels=%u port=%u%s",
+		    id, node_name, desc, channels, s->port,
+		    is_enabled(impl, node_name) ? "" : " [disabled by metadata]");
 
-	publish_service(s);
+	service_apply_state(s);
 }
 
 static void registry_global_remove(void *data, uint32_t id)
 {
 	struct impl *impl = data;
+
+	if (id == impl->metadata_id && impl->metadata) {
+		pw_log_info("default metadata gone");
+		spa_hook_remove(&impl->metadata_listener);
+		pw_proxy_destroy(impl->metadata);
+		impl->metadata = NULL;
+		impl->metadata_id = SPA_ID_INVALID;
+		return;
+	}
+
 	struct service *s = find_service_by_id(impl, id);
 	if (s == NULL)
 		return;
 	pw_log_info("local node id=%u gone — unpublishing", id);
 	service_free(s);
+}
+
+/* -- metadata events -------------------------------------------------- */
+
+static int meta_property(void *data, uint32_t subject,
+			 const char *key, const char *type SPA_UNUSED,
+			 const char *value)
+{
+	struct impl *impl = data;
+
+	/* We only care about per-host keys (subject = PW_ID_CORE = 0) that
+	 * carry our prefix. Ignore everything else; the default metadata
+	 * carries `default.audio.sink` etc. */
+	if (subject != PW_ID_CORE || key == NULL)
+		return 0;
+	if (strncmp(key, PWNZ_META_PREFIX, sizeof(PWNZ_META_PREFIX) - 1) != 0)
+		return 0;
+
+	const char *tail = key + sizeof(PWNZ_META_PREFIX) - 1;
+	size_t tail_len = strlen(tail);
+	size_t suf_len = sizeof(PWNZ_META_SUFFIX) - 1;
+	if (tail_len < suf_len ||
+	    strcmp(tail + tail_len - suf_len, PWNZ_META_SUFFIX) != 0) {
+		pw_log_debug("ignoring unrelated key '%s'", key);
+		return 0;
+	}
+
+	size_t node_name_len = tail_len - suf_len;
+	char *node_name = strndup(tail, node_name_len);
+	if (node_name == NULL)
+		return -ENOMEM;
+
+	struct meta_entry *e = meta_find(impl, node_name);
+
+	if (value == NULL) {
+		/* cleared → revert to default (enabled) */
+		if (e) {
+			pw_log_info("metadata key for '%s' cleared", node_name);
+			meta_entry_free(e);
+		}
+	} else {
+		bool en = spa_atob(value);
+		if (e == NULL) {
+			e = calloc(1, sizeof(*e));
+			if (e == NULL) {
+				free(node_name);
+				return -ENOMEM;
+			}
+			e->node_name = strdup(node_name);
+			spa_list_append(&impl->meta_entries, &e->link);
+		}
+		e->enabled = en;
+		pw_log_info("metadata: %s = %s", node_name, en ? "true" : "false");
+	}
+
+	struct service *s = find_service_by_node_name(impl, node_name);
+	if (s != NULL)
+		service_apply_state(s);
+
+	free(node_name);
+	return 0;
 }
 
 static const struct pw_registry_events registry_events = {
@@ -498,6 +660,9 @@ static int publish_service(struct service *s)
 	AvahiStringList *txt;
 	int err;
 
+	if (!is_enabled(impl, s->node_name))
+		return 0;
+
 	if (impl->avahi_client == NULL ||
 	    avahi_client_get_state(impl->avahi_client) != AVAHI_CLIENT_S_RUNNING)
 		return 0;
@@ -568,7 +733,7 @@ static void republish_all(struct impl *impl)
 {
 	struct service *s;
 	spa_list_for_each(s, &impl->services, link)
-		publish_service(s);
+		service_apply_state(s);
 }
 
 static void unpublish_all(struct impl *impl)
@@ -582,15 +747,39 @@ static void unpublish_all(struct impl *impl)
 	}
 }
 
-static void service_free(struct service *s)
+static void unpublish_service(struct service *s)
 {
-	spa_list_remove(&s->link);
-	if (s->entry_group)
+	if (s->entry_group) {
 		avahi_entry_group_free(s->entry_group);
+		s->entry_group = NULL;
+	}
 	if (s->rtp_mod) {
 		spa_hook_remove(&s->rtp_mod_listener);
 		pw_impl_module_destroy(s->rtp_mod);
+		s->rtp_mod = NULL;
 	}
+	s->name_collision_count = 0;
+}
+
+static void service_apply_state(struct service *s)
+{
+	bool want = is_enabled(s->impl, s->node_name);
+	bool have = s->entry_group != NULL || s->rtp_mod != NULL;
+	if (want == have)
+		return;
+	if (want) {
+		pw_log_info("enabling '%s' via metadata", s->node_name);
+		publish_service(s);
+	} else {
+		pw_log_info("disabling '%s' via metadata", s->node_name);
+		unpublish_service(s);
+	}
+}
+
+static void service_free(struct service *s)
+{
+	spa_list_remove(&s->link);
+	unpublish_service(s);
 	free(s->node_name);
 	free(s->node_description);
 	free(s);
@@ -679,9 +868,18 @@ static const struct pw_proxy_events core_proxy_events = {
 static void impl_free(struct impl *impl)
 {
 	struct service *s;
+	struct meta_entry *e;
 
 	spa_list_consume(s, &impl->services, link)
 		service_free(s);
+	spa_list_consume(e, &impl->meta_entries, link)
+		meta_entry_free(e);
+
+	if (impl->metadata) {
+		spa_hook_remove(&impl->metadata_listener);
+		pw_proxy_destroy(impl->metadata);
+		impl->metadata = NULL;
+	}
 
 	if (impl->registry) {
 		spa_hook_remove(&impl->registry_listener);
@@ -750,7 +948,9 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	impl->module = module;
 	impl->context = context;
 	impl->props = props;
+	impl->metadata_id = SPA_ID_INVALID;
 	spa_list_init(&impl->services);
+	spa_list_init(&impl->meta_entries);
 
 	if (gethostname(impl->host_name, sizeof(impl->host_name)) < 0)
 		snprintf(impl->host_name, sizeof(impl->host_name), "pipewire");

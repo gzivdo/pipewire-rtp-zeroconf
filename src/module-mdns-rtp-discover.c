@@ -27,8 +27,17 @@
 #include <avahi-common/error.h>
 #include <avahi-common/malloc.h>
 
+#include <pipewire/extensions/metadata.h>
+
 #include "avahi-poll.h"
 #include "common.h"
+
+/* Metadata key prefix for runtime per-peer-card toggles.
+ *   pipewire-net-zeroconf.discover.<peer-host>.<peer-node>.enabled = "true"|"false"
+ * Subject = 0. Default (key absent) = enabled.
+ */
+#define PWNZ_META_PREFIX  "pipewire-net-zeroconf.discover."
+#define PWNZ_META_SUFFIX  ".enabled"
 
 #define NAME "mdns-rtp-discover"
 
@@ -60,8 +69,27 @@ struct tunnel {
 	char *peer_node;     /* TXT node-name */
 	bool  is_sink_mode;  /* TXT mode=sink → we create local Audio/Sink */
 
+	/* Cached resolution payload so we can (re)create the rtp module
+	 * later, e.g. when a metadata toggle re-enables this peer. */
+	char *peer_addr;
+	uint16_t peer_port;
+	char *rate;
+	char *channels;
+	char *format;
+	char *codec;
+	char *description;
+	char *transport;
+	char *multicast_ip;
+	char *multicast_ttl;
+
 	struct pw_impl_module *rtp_mod;
 	struct spa_hook rtp_mod_listener;
+};
+
+struct meta_entry {
+	struct spa_list link;
+	char *key_tail;   /* peer-host.peer-node */
+	bool enabled;
 };
 
 struct impl {
@@ -70,6 +98,17 @@ struct impl {
 	struct spa_hook module_listener;
 
 	struct pw_properties *props;
+
+	/* PW client + registry + default metadata (bound lazily). */
+	struct pw_core *core;
+	struct spa_hook core_proxy_listener;
+	struct spa_hook core_listener;
+	struct pw_registry *registry;
+	struct spa_hook registry_listener;
+	struct pw_proxy *metadata;
+	struct spa_hook metadata_listener;
+	uint32_t metadata_id;
+	struct spa_list meta_entries;
 
 	AvahiPoll *avahi_poll;
 	AvahiClient *avahi_client;
@@ -88,6 +127,50 @@ struct impl {
 
 static int start_avahi_client(struct impl *impl);
 static void tunnel_free(struct tunnel *t);
+static int load_local_endpoint(struct tunnel *t,
+			       const char *peer_addr, uint16_t peer_port,
+			       const char *rate, const char *channels,
+			       const char *format, const char *codec,
+			       const char *description,
+			       const char *transport,
+			       const char *multicast_ip,
+			       const char *multicast_ttl);
+
+/* -- helper: derive metadata-key-tail and lookup --------------------- */
+
+static char *make_key_tail(const char *peer_host, const char *peer_node)
+{
+	char *out = NULL;
+	if (asprintf(&out, "%s.%s", peer_host, peer_node) < 0)
+		return NULL;
+	return out;
+}
+
+static struct meta_entry *meta_find(struct impl *impl, const char *key_tail)
+{
+	struct meta_entry *e;
+	spa_list_for_each(e, &impl->meta_entries, link)
+		if (spa_streq(e->key_tail, key_tail))
+			return e;
+	return NULL;
+}
+
+static bool is_enabled(struct impl *impl, const char *peer_host, const char *peer_node)
+{
+	char *kt = make_key_tail(peer_host, peer_node);
+	if (kt == NULL)
+		return true;
+	struct meta_entry *e = meta_find(impl, kt);
+	free(kt);
+	return e == NULL ? true : e->enabled;
+}
+
+static void meta_entry_free(struct meta_entry *e)
+{
+	spa_list_remove(&e->link);
+	free(e->key_tail);
+	free(e);
+}
 
 /* -- helpers ----------------------------------------------------------- */
 
@@ -132,6 +215,35 @@ static char *sanitize_for_node_name(const char *s)
 }
 
 /* -- child module loading --------------------------------------------- */
+
+static void unload_local_endpoint(struct tunnel *t)
+{
+	if (t->rtp_mod) {
+		spa_hook_remove(&t->rtp_mod_listener);
+		pw_impl_module_destroy(t->rtp_mod);
+		t->rtp_mod = NULL;
+	}
+}
+
+static void tunnel_apply_state(struct tunnel *t)
+{
+	bool want = is_enabled(t->impl, t->peer_host, t->peer_node);
+	bool have = t->rtp_mod != NULL;
+	if (want == have)
+		return;
+	if (want) {
+		pw_log_info("enabling '%s' via metadata", t->avahi_name);
+		if (t->peer_addr)
+			load_local_endpoint(t, t->peer_addr, t->peer_port,
+					    t->rate, t->channels, t->format,
+					    t->codec, t->description,
+					    t->transport, t->multicast_ip,
+					    t->multicast_ttl);
+	} else {
+		pw_log_info("disabling '%s' via metadata", t->avahi_name);
+		unload_local_endpoint(t);
+	}
+}
 
 static void rtp_mod_destroyed(void *data)
 {
@@ -366,15 +478,31 @@ static void resolver_cb(AvahiServiceResolver *r,
 
 	avahi_address_snprint(addr_buf, sizeof(addr_buf), a);
 
-	load_local_endpoint(t, addr_buf, port,
-			    kv.rate     ? kv.rate     : "48000",
-			    kv.channels ? kv.channels : "2",
-			    kv.format   ? kv.format   : PWNZ_DEFAULT_FORMAT,
-			    kv.codec    ? kv.codec    : PWNZ_DEFAULT_CODEC,
-			    kv.description ? kv.description : kv.node_name,
-			    kv.transport,
-			    kv.mcast_ip,
-			    kv.mcast_ttl);
+	/* Cache resolution payload so the metadata-toggle path can re-load
+	 * later. Old values freed first. */
+	#define REPLACE_OPT(field, src) do { free(t->field); t->field = (src) ? strdup(src) : NULL; } while (0)
+	#define REPLACE(field, src)     do { free(t->field); t->field = strdup(src); } while (0)
+	REPLACE(peer_addr,    addr_buf);
+	REPLACE(rate,         kv.rate     ? kv.rate     : "48000");
+	REPLACE(channels,     kv.channels ? kv.channels : "2");
+	REPLACE(format,       kv.format   ? kv.format   : PWNZ_DEFAULT_FORMAT);
+	REPLACE(codec,        kv.codec    ? kv.codec    : PWNZ_DEFAULT_CODEC);
+	REPLACE(description,  kv.description ? kv.description : kv.node_name);
+	REPLACE_OPT(transport,    kv.transport);
+	REPLACE_OPT(multicast_ip, kv.mcast_ip);
+	REPLACE_OPT(multicast_ttl, kv.mcast_ttl);
+	#undef REPLACE
+	#undef REPLACE_OPT
+	t->peer_port = port;
+
+	if (is_enabled(impl, t->peer_host, t->peer_node)) {
+		load_local_endpoint(t, t->peer_addr, t->peer_port,
+				    t->rate, t->channels, t->format, t->codec,
+				    t->description, t->transport,
+				    t->multicast_ip, t->multicast_ttl);
+	} else {
+		pw_log_info("'%s' disabled by metadata — not loading", name);
+	}
 
 done:
 	txt_kv_free(&kv);
@@ -430,13 +558,19 @@ static void browser_cb(AvahiServiceBrowser *b SPA_UNUSED,
 static void tunnel_free(struct tunnel *t)
 {
 	spa_list_remove(&t->link);
-	if (t->rtp_mod) {
-		spa_hook_remove(&t->rtp_mod_listener);
-		pw_impl_module_destroy(t->rtp_mod);
-	}
+	unload_local_endpoint(t);
 	free(t->avahi_name);
 	free(t->peer_host);
 	free(t->peer_node);
+	free(t->peer_addr);
+	free(t->rate);
+	free(t->channels);
+	free(t->format);
+	free(t->codec);
+	free(t->description);
+	free(t->transport);
+	free(t->multicast_ip);
+	free(t->multicast_ttl);
 	free(t);
 }
 
@@ -496,14 +630,186 @@ static int start_avahi_client(struct impl *impl)
 	return 0;
 }
 
+/* -- metadata events -------------------------------------------------- */
+
+static struct tunnel *find_tunnel_by_peer(struct impl *impl,
+					  const char *peer_host,
+					  const char *peer_node)
+{
+	struct tunnel *t;
+	spa_list_for_each(t, &impl->tunnels, link) {
+		if (spa_streq(t->peer_host, peer_host) &&
+		    spa_streq(t->peer_node, peer_node))
+			return t;
+	}
+	return NULL;
+}
+
+static int meta_property(void *data, uint32_t subject,
+			 const char *key, const char *type SPA_UNUSED,
+			 const char *value)
+{
+	struct impl *impl = data;
+
+	if (subject != PW_ID_CORE || key == NULL)
+		return 0;
+	if (strncmp(key, PWNZ_META_PREFIX, sizeof(PWNZ_META_PREFIX) - 1) != 0)
+		return 0;
+	const char *tail = key + sizeof(PWNZ_META_PREFIX) - 1;
+	size_t tail_len = strlen(tail);
+	size_t suf_len = sizeof(PWNZ_META_SUFFIX) - 1;
+	if (tail_len < suf_len ||
+	    strcmp(tail + tail_len - suf_len, PWNZ_META_SUFFIX) != 0)
+		return 0;
+	size_t kt_len = tail_len - suf_len;
+	char *kt = strndup(tail, kt_len);
+	if (kt == NULL)
+		return -ENOMEM;
+
+	/* kt = "peer_host.peer_node". Cache it as-is for meta_find lookup,
+	 * then split into peer_host / peer_node for tunnel matching. */
+	char *dot = strchr(kt, '.');
+	if (dot == NULL) {
+		free(kt);
+		return 0;
+	}
+
+	struct meta_entry *e = meta_find(impl, kt);
+
+	if (value == NULL) {
+		if (e) {
+			pw_log_info("metadata key cleared: %s", kt);
+			meta_entry_free(e);
+		}
+	} else {
+		bool en = spa_atob(value);
+		if (e == NULL) {
+			e = calloc(1, sizeof(*e));
+			if (e == NULL) { free(kt); return -ENOMEM; }
+			e->key_tail = strdup(kt);
+			spa_list_append(&impl->meta_entries, &e->link);
+		}
+		e->enabled = en;
+		pw_log_info("metadata: %s = %s", kt, en ? "true" : "false");
+	}
+
+	/* Now split and re-evaluate the matching tunnel. */
+	*dot = '\0';
+	const char *peer_host = kt;
+	const char *peer_node = dot + 1;
+	struct tunnel *t = find_tunnel_by_peer(impl, peer_host, peer_node);
+	if (t != NULL)
+		tunnel_apply_state(t);
+
+	free(kt);
+	return 0;
+}
+
+static const struct pw_metadata_events metadata_events = {
+	PW_VERSION_METADATA_EVENTS,
+	.property = meta_property,
+};
+
+/* -- pw registry / core listener ------------------------------------- */
+
+static void registry_global(void *data,
+			    uint32_t id,
+			    uint32_t permissions SPA_UNUSED,
+			    const char *type,
+			    uint32_t version SPA_UNUSED,
+			    const struct spa_dict *props)
+{
+	struct impl *impl = data;
+
+	if (!spa_streq(type, PW_TYPE_INTERFACE_Metadata) || props == NULL)
+		return;
+	if (impl->metadata != NULL)
+		return;
+	if (!spa_streq(spa_dict_lookup(props, "metadata.name"), "default"))
+		return;
+
+	impl->metadata = pw_registry_bind(impl->registry, id, type,
+					  PW_VERSION_METADATA, 0);
+	if (impl->metadata == NULL)
+		return;
+	impl->metadata_id = id;
+	pw_metadata_add_listener((struct pw_metadata *) impl->metadata,
+				 &impl->metadata_listener,
+				 &metadata_events, impl);
+	pw_log_info("bound default metadata id=%u", id);
+}
+
+static void registry_global_remove(void *data, uint32_t id)
+{
+	struct impl *impl = data;
+	if (id != impl->metadata_id || impl->metadata == NULL)
+		return;
+	pw_log_info("default metadata gone");
+	spa_hook_remove(&impl->metadata_listener);
+	pw_proxy_destroy(impl->metadata);
+	impl->metadata = NULL;
+	impl->metadata_id = SPA_ID_INVALID;
+}
+
+static const struct pw_registry_events registry_events = {
+	PW_VERSION_REGISTRY_EVENTS,
+	.global = registry_global,
+	.global_remove = registry_global_remove,
+};
+
+static void on_core_error(void *data, uint32_t id, int seq, int res,
+			  const char *message)
+{
+	struct impl *impl = data;
+	pw_log_error("core error id:%u seq:%d res:%d: %s", id, seq, res, message);
+	if (id == PW_ID_CORE && res == -EPIPE)
+		pw_impl_module_schedule_destroy(impl->module);
+}
+
+static const struct pw_core_events core_events = {
+	PW_VERSION_CORE_EVENTS,
+	.error = on_core_error,
+};
+
+static void on_core_proxy_destroy(void *data)
+{
+	struct impl *impl = data;
+	spa_hook_remove(&impl->core_proxy_listener);
+	impl->core = NULL;
+	pw_impl_module_schedule_destroy(impl->module);
+}
+
+static const struct pw_proxy_events core_proxy_events = {
+	PW_VERSION_PROXY_EVENTS,
+	.destroy = on_core_proxy_destroy,
+};
+
 /* -- module lifecycle ------------------------------------------------- */
 
 static void impl_free(struct impl *impl)
 {
 	struct tunnel *t;
+	struct meta_entry *e;
 
 	spa_list_consume(t, &impl->tunnels, link)
 		tunnel_free(t);
+	spa_list_consume(e, &impl->meta_entries, link)
+		meta_entry_free(e);
+
+	if (impl->metadata) {
+		spa_hook_remove(&impl->metadata_listener);
+		pw_proxy_destroy(impl->metadata);
+		impl->metadata = NULL;
+	}
+	if (impl->registry) {
+		spa_hook_remove(&impl->registry_listener);
+		pw_proxy_destroy((struct pw_proxy *) impl->registry);
+	}
+	if (impl->core) {
+		spa_hook_remove(&impl->core_listener);
+		spa_hook_remove(&impl->core_proxy_listener);
+		pw_core_disconnect(impl->core);
+	}
 
 	if (impl->browser)
 		avahi_service_browser_free(impl->browser);
@@ -554,7 +860,9 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	impl->module = module;
 	impl->context = context;
 	impl->props = props;
+	impl->metadata_id = SPA_ID_INVALID;
 	spa_list_init(&impl->tunnels);
+	spa_list_init(&impl->meta_entries);
 
 	impl->discover_sink   = pw_properties_get_bool(props, "discover.sink",   true);
 	impl->discover_source = pw_properties_get_bool(props, "discover.source", false);
@@ -582,6 +890,27 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	pw_impl_module_add_listener(module, &impl->module_listener,
 				    &module_events, impl);
 	pw_impl_module_update_properties(module, &SPA_DICT_INIT_ARRAY(module_props));
+
+	/* Connect to PW + bind default metadata so we can listen for
+	 * per-peer toggle keys (pipewire-net-zeroconf.discover.*.enabled).
+	 * Failures here are non-fatal — the module still works without
+	 * runtime toggle support. */
+	impl->core = pw_context_connect(context, NULL, 0);
+	if (impl->core != NULL) {
+		pw_proxy_add_listener((struct pw_proxy *) impl->core,
+				      &impl->core_proxy_listener,
+				      &core_proxy_events, impl);
+		pw_core_add_listener(impl->core, &impl->core_listener,
+				     &core_events, impl);
+		impl->registry = pw_core_get_registry(impl->core,
+						      PW_VERSION_REGISTRY, 0);
+		if (impl->registry != NULL)
+			pw_registry_add_listener(impl->registry,
+						 &impl->registry_listener,
+						 &registry_events, impl);
+	} else {
+		pw_log_warn("pw_context_connect failed: %m — metadata toggles disabled");
+	}
 
 	impl->avahi_poll = pw_avahi_poll_new(context);
 	if (impl->avahi_poll == NULL) {

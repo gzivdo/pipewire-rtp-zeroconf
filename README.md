@@ -117,6 +117,62 @@ two stacked module loads.
 | `discover.ptime.msec` | `5` | must match the publish side's value |
 | `discover.latency.msec` | `200` | jitter buffer target; must be a clean multiple of `ptime` |
 
+## Runtime toggles via metadata
+
+Both modules listen for per-card `enabled` keys on the default PipeWire
+metadata (provided by WirePlumber on every modern desktop). This lets you
+disable / re-enable a specific card or peer **without editing config and
+restarting pipewire**.
+
+### Disable / enable a local card on the publish side
+
+```bash
+# stop publishing one specific local sink (its Avahi entry is withdrawn
+# and the rtp-source child module is unloaded immediately):
+pw-metadata 0 "pipewire-net-zeroconf.publish.alsa_output.pci-0000_00_1f.3.analog-stereo.enabled" "false"
+
+# re-enable:
+pw-metadata 0 "pipewire-net-zeroconf.publish.alsa_output.pci-0000_00_1f.3.analog-stereo.enabled" "true"
+
+# clear the explicit value — falls back to default (= enabled):
+pw-metadata -d 0 "pipewire-net-zeroconf.publish.alsa_output.pci-0000_00_1f.3.analog-stereo.enabled"
+```
+
+The key is `pipewire-net-zeroconf.publish.<node.name>.enabled`. Look up the
+local `node.name` with `wpctl status` or `pactl list short sinks`.
+
+### Disable / enable a discovered remote card on the discover side
+
+```bash
+# stop creating a local virtual sink for a specific peer card
+# (the rtp-sink child is unloaded; the sink disappears from pavucontrol):
+pw-metadata 0 "pipewire-net-zeroconf.discover.<peer-host>.<peer-node-name>.enabled" "false"
+
+# re-enable:
+pw-metadata 0 "pipewire-net-zeroconf.discover.<peer-host>.<peer-node-name>.enabled" "true"
+```
+
+The key parts come from the TXT records of the published service:
+`<peer-host>` is the publishing machine's hostname, `<peer-node-name>` is
+the remote card's `node.name`. You can read both from
+`avahi-browse -r _pipewire-rtp._udp` (look at the `host` and `node-name`
+TXT entries).
+
+### Listing current toggle state
+
+```bash
+pw-metadata 0 | grep pipewire-net-zeroconf
+```
+
+### Persistence
+
+Metadata is **runtime state** — it does not survive a `pipewire` restart
+on its own. If you want a permanent disable, drop a small script in your
+session autostart that sets the key after pipewire is up, or simply edit
+the conf-file to use the policy you want at boot. A persistent metadata
+store (similar to WirePlumber's `restore-stream`) is a candidate for a
+future iteration.
+
 ## Tuning
 
 Defaults are chosen so it just works on a normal home LAN with 1500-byte
