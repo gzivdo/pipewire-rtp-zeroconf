@@ -1,0 +1,30 @@
+pipewire-net-zeroconf (0.1.1-1) unstable; urgency=medium
+
+  * Split into three binary packages:
+      - pipewire-net-zeroconf-publish   (speaker-host)
+      - pipewire-net-zeroconf-discover  (app-host)
+      - pipewire-net-zeroconf           (metapackage)
+    Most hosts only need one of the two; the previous single-package
+    layout caused both sides to load by default which led to spurious
+    rtp-sink connect errors on speaker-only hosts.
+  * Drop-in confs renamed and now ship one per module:
+      30-net-zeroconf-publish.conf, 31-net-zeroconf-discover.conf.
+  * Suppress upstream rtp-source's bogus IGMP-recovery noise in unicast
+    bindings via igmp.check.interval.sec = 31536000.
+  * Avahi name collision: retry add_service up to 16 times with
+    avahi_alternative_service_name() to handle multiple cards sharing a
+    description.
+
+ -- pipewire-net-zeroconf <maintainer@example.invalid>  Sat, 16 May 2026 19:00:00 +0000
+
+pipewire-net-zeroconf (0.1.0-1) unstable; urgency=medium
+
+  * Initial release.
+    - libpipewire-module-mdns-rtp-publish: per-card Avahi entries with
+      libpipewire-module-rtp-source as receiver.
+    - libpipewire-module-mdns-rtp-discover: per-peer-card virtual sink/source
+      with stable node.name across hotplug.
+    - Defaults: publish sinks, do not publish sources; discover sinks,
+      do not discover sources. L16 BE 48000 Hz stereo. Unicast.
+
+ -- pipewire-net-zeroconf <maintainer@example.invalid>  Sat, 16 May 2026 13:43:52 +0000

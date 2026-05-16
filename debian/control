@@ -1,0 +1,57 @@
+Source: pipewire-net-zeroconf
+Section: sound
+Priority: optional
+Maintainer: pipewire-net-zeroconf <maintainer@example.invalid>
+Build-Depends: debhelper-compat (= 13),
+               meson (>= 0.59),
+               ninja-build,
+               pkgconf,
+               libpipewire-0.3-dev (>= 0.3.60),
+               libspa-0.2-dev,
+               libavahi-client-dev
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+
+Package: pipewire-net-zeroconf-publish
+Architecture: linux-any
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+         pipewire (>= 0.3.60),
+         avahi-daemon
+Description: PipeWire mDNS/RTP audio sharing — publish (speaker-host) side
+ Native PipeWire module that exposes local audio sinks (and optionally
+ sources) on the LAN via Avahi/mDNS under the _pipewire-rtp._udp service
+ type. Remote machines running pipewire-net-zeroconf-discover will see
+ each local card as a virtual sink they can play into.
+ .
+ Loaded by /usr/share/pipewire/pipewire.conf.d/30-net-zeroconf-publish.conf.
+ .
+ Install this package on machines that own audio hardware (speakers,
+ amplifier inputs, USB DACs).
+
+Package: pipewire-net-zeroconf-discover
+Architecture: linux-any
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+         pipewire (>= 0.3.60),
+         avahi-daemon
+Description: PipeWire mDNS/RTP audio sharing — discover (app-host) side
+ Native PipeWire module that browses Avahi for LAN peers publishing
+ _pipewire-rtp._udp services and instantiates a local virtual Audio/Sink
+ (or Audio/Source) per remote card, with stable node names so per-app
+ routing survives reconnect.
+ .
+ Loaded by /usr/share/pipewire/pipewire.conf.d/31-net-zeroconf-discover.conf.
+ .
+ Install this package on machines that run applications producing audio
+ (web browsers, music players) which should be playable on remote
+ speakers.
+
+Package: pipewire-net-zeroconf
+Architecture: all
+Depends: pipewire-net-zeroconf-publish (= ${binary:Version}),
+         pipewire-net-zeroconf-discover (= ${binary:Version})
+Description: PipeWire mDNS/RTP audio sharing — both sides (metapackage)
+ Convenience metapackage that installs both pipewire-net-zeroconf-publish
+ and pipewire-net-zeroconf-discover. Use when a single host should both
+ share its own audio and consume LAN peers' audio.
