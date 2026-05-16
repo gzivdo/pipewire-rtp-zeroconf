@@ -283,9 +283,13 @@ static bool should_publish(struct impl *impl, const struct spa_dict *props,
 		return false;
 
 	bool is_sink, is_source;
-	if (spa_streq(media_class, "Audio/Sink"))
+	/* Accept both bare "Audio/Sink" and qualified variants like
+	 * "Audio/Sink/Virtual"; same for Source. */
+	if (strncmp(media_class, "Audio/Sink", 10) == 0 &&
+	    (media_class[10] == '\0' || media_class[10] == '/'))
 		is_sink = true, is_source = false;
-	else if (spa_streq(media_class, "Audio/Source"))
+	else if (strncmp(media_class, "Audio/Source", 12) == 0 &&
+		 (media_class[12] == '\0' || media_class[12] == '/'))
 		is_sink = false, is_source = true;
 	else
 		return false;
@@ -523,81 +527,127 @@ static const struct pw_impl_module_events rtp_mod_events = {
 	.destroy = rtp_mod_destroyed,
 };
 
-static int load_rtp_source_for(struct service *s)
+/* sink-direction (peer wants to PLAY into our local sink):
+ *   load module-rtp-source — listens on UDP, writes into local Audio/Sink.
+ * source-direction (peer wants to LISTEN to our local mic):
+ *   load module-rtp-sink — reads from local Audio/Source, sends UDP.
+ *   Only the multicast transport is functional in this version; for
+ *   unicast source-direction see Stage 24b (mDNS request-record). */
+static int load_local_endpoint(struct service *s)
 {
 	struct impl *impl = s->impl;
 	FILE *f;
 	char *args;
 	size_t size;
+	const char *child_mod;
+	char pbuf[32];
+	spa_dtoa(pbuf, sizeof(pbuf), impl->ptime_ms);
+
+	/* Unicast source-direction needs the request-record back-channel to
+	 * know where to send; without it we have no destination. Skip with
+	 * a warning until Stage 24b lands. */
+	if (!s->is_sink && !impl->multicast) {
+		pw_log_warn("source-direction '%s' needs publish.transport=multicast "
+			    "in this version; unicast source via request-record "
+			    "is not yet implemented", s->node_name);
+		return -ENOTSUP;
+	}
 
 	if ((f = open_memstream(&args, &size)) == NULL)
 		return -errno;
 
-	fprintf(f, "{ ");
-	if (impl->multicast) {
-		fprintf(f, "source.ip = \"%s\" ", impl->multicast_ip);
-		fprintf(f, "net.ttl = %u ", impl->multicast_ttl);
-		fprintf(f, "net.loop = %s ", impl->multicast_loop ? "true" : "false");
-	} else {
-		fprintf(f, "source.ip = \"0.0.0.0\" ");
-	}
-	fprintf(f, "source.port = %u ", s->port);
-	fprintf(f, "sess.media = \"%s\" ",
-		spa_streq(impl->codec, "opus") ? "opus" : "audio");
-	fprintf(f, "audio.format = \"%s\" ", impl->format);
-	fprintf(f, "audio.rate = %u ", impl->rate);
-	fprintf(f, "audio.channels = %u ", s->channels);
-	fprintf(f, "sess.latency.msec = %u ", impl->latency_ms);
-	char pbuf[32];
-	spa_dtoa(pbuf, sizeof(pbuf), impl->ptime_ms);
-	fprintf(f, "stream.props = { ");
-	fprintf(f, "node.network = true ");
-	fprintf(f, "stream.may-pause = true ");
-	fprintf(f, "rtp.ptime = %s ", pbuf);
-	/* Suppress upstream's bogus IGMP recovery for unicast bindings.
-	 * rtp-source unconditionally enables an IGMP-rejoin timer even when
-	 * source.ip=0.0.0.0 (unicast). And its `last_packet_time` defaults
-	 * to 0, so the deadline check `current_time - 0 >= deadline` is
-	 * always true on the first tick. Killing `check.interval` ensures
-	 * the timer never fires. */
-	if (!impl->multicast)
-		fprintf(f, "igmp.check.interval.sec = 31536000 ");
-	if (impl->sap_enabled && impl->multicast) {
-		const char *mime = spa_streq(impl->codec, "opus")
-			? "audio/opus" : "audio/L16";
-		fprintf(f, "sess.sap.announce = true ");
-		fprintf(f, "sess.name = \"%s\" ", s->service_name);
-		fprintf(f, "rtp.destination.ip = \"%s\" ", impl->multicast_ip);
-		fprintf(f, "rtp.destination.port = %u ", s->port);
-		fprintf(f, "rtp.ttl = %u ", impl->multicast_ttl);
-		fprintf(f, "rtp.media = \"audio\" ");
-		fprintf(f, "rtp.mime = \"%s\" ", mime);
-		fprintf(f, "rtp.payload = %u ", PWNZ_DEFAULT_PAYLOAD);
-		fprintf(f, "rtp.rate = %u ", impl->rate);
-		fprintf(f, "rtp.channels = %u ", s->channels);
-	}
-	/* Route received audio into the specific local node. */
 	if (s->is_sink) {
+		/* Receiver path: rtp-source listening on UDP. */
+		child_mod = "libpipewire-module-rtp-source";
+		fprintf(f, "{ ");
+		if (impl->multicast) {
+			fprintf(f, "source.ip = \"%s\" ", impl->multicast_ip);
+			fprintf(f, "net.ttl = %u ", impl->multicast_ttl);
+			fprintf(f, "net.loop = %s ",
+				impl->multicast_loop ? "true" : "false");
+		} else {
+			fprintf(f, "source.ip = \"0.0.0.0\" ");
+		}
+		fprintf(f, "source.port = %u ", s->port);
+		fprintf(f, "sess.media = \"%s\" ",
+			spa_streq(impl->codec, "opus") ? "opus" : "audio");
+		fprintf(f, "audio.format = \"%s\" ", impl->format);
+		fprintf(f, "audio.rate = %u ", impl->rate);
+		fprintf(f, "audio.channels = %u ", s->channels);
+		fprintf(f, "sess.latency.msec = %u ", impl->latency_ms);
+		fprintf(f, "stream.props = { ");
+		fprintf(f, "node.network = true ");
+		fprintf(f, "stream.may-pause = true ");
+		fprintf(f, "rtp.ptime = %s ", pbuf);
+		if (!impl->multicast)
+			fprintf(f, "igmp.check.interval.sec = 31536000 ");
+		if (impl->sap_enabled && impl->multicast) {
+			const char *mime = spa_streq(impl->codec, "opus")
+				? "audio/opus" : "audio/L16";
+			fprintf(f, "sess.sap.announce = true ");
+			fprintf(f, "sess.name = \"%s\" ", s->service_name);
+			fprintf(f, "rtp.destination.ip = \"%s\" ", impl->multicast_ip);
+			fprintf(f, "rtp.destination.port = %u ", s->port);
+			fprintf(f, "rtp.ttl = %u ", impl->multicast_ttl);
+			fprintf(f, "rtp.media = \"audio\" ");
+			fprintf(f, "rtp.mime = \"%s\" ", mime);
+			fprintf(f, "rtp.payload = %u ", PWNZ_DEFAULT_PAYLOAD);
+			fprintf(f, "rtp.rate = %u ", impl->rate);
+			fprintf(f, "rtp.channels = %u ", s->channels);
+		}
 		fprintf(f, "media.class = \"Stream/Output/Audio\" ");
 		fprintf(f, "node.target = \"%s\" ", s->node_name);
+		fprintf(f, "node.description = \"net-rx %s\" ", s->node_name);
+		fprintf(f, "} }");
 	} else {
+		/* Sender path (mic): rtp-sink reading from local mic source,
+		 * sending to multicast group. */
+		child_mod = "libpipewire-module-rtp-sink";
+		fprintf(f, "{ ");
+		fprintf(f, "destination.ip = \"%s\" ", impl->multicast_ip);
+		fprintf(f, "destination.port = %u ", s->port);
+		fprintf(f, "net.ttl = %u ", impl->multicast_ttl);
+		fprintf(f, "net.loop = %s ",
+			impl->multicast_loop ? "true" : "false");
+		fprintf(f, "sess.media = \"%s\" ",
+			spa_streq(impl->codec, "opus") ? "opus" : "audio");
+		fprintf(f, "audio.format = \"%s\" ", impl->format);
+		fprintf(f, "audio.rate = %u ", impl->rate);
+		fprintf(f, "audio.channels = %u ", s->channels);
+		fprintf(f, "sess.latency.msec = %u ", impl->latency_ms);
+		fprintf(f, "stream.props = { ");
+		fprintf(f, "node.network = true ");
 		fprintf(f, "media.class = \"Stream/Input/Audio\" ");
 		fprintf(f, "node.target = \"%s\" ", s->node_name);
+		fprintf(f, "node.description = \"net-tx %s\" ", s->node_name);
+		fprintf(f, "rtp.ptime = %s ", pbuf);
+		if (impl->sap_enabled) {
+			const char *mime = spa_streq(impl->codec, "opus")
+				? "audio/opus" : "audio/L16";
+			fprintf(f, "sess.sap.announce = true ");
+			fprintf(f, "sess.name = \"%s\" ", s->service_name);
+			fprintf(f, "rtp.destination.ip = \"%s\" ", impl->multicast_ip);
+			fprintf(f, "rtp.destination.port = %u ", s->port);
+			fprintf(f, "rtp.ttl = %u ", impl->multicast_ttl);
+			fprintf(f, "rtp.media = \"audio\" ");
+			fprintf(f, "rtp.mime = \"%s\" ", mime);
+			fprintf(f, "rtp.payload = %u ", PWNZ_DEFAULT_PAYLOAD);
+			fprintf(f, "rtp.rate = %u ", impl->rate);
+			fprintf(f, "rtp.channels = %u ", s->channels);
+		}
+		fprintf(f, "} }");
 	}
-	fprintf(f, "node.description = \"net-rx %s\" ", s->node_name);
-	fprintf(f, "} }");
 	fclose(f);
 
-	pw_log_debug("loading rtp-source: %s", args);
+	pw_log_debug("loading %s: %s", child_mod, args);
 
-	s->rtp_mod = pw_context_load_module(impl->context,
-					    "libpipewire-module-rtp-source",
+	s->rtp_mod = pw_context_load_module(impl->context, child_mod,
 					    args, NULL);
 	free(args);
 
 	if (s->rtp_mod == NULL) {
-		pw_log_error("failed to load rtp-source for %s: %m",
-			     s->node_name);
+		pw_log_error("failed to load %s for %s: %m",
+			     child_mod, s->node_name);
 		return -errno;
 	}
 
@@ -713,7 +763,7 @@ static int publish_service(struct service *s)
 	    avahi_client_get_state(impl->avahi_client) != AVAHI_CLIENT_S_RUNNING)
 		return 0;
 
-	if (s->rtp_mod == NULL && load_rtp_source_for(s) < 0)
+	if (s->rtp_mod == NULL && load_local_endpoint(s) < 0)
 		return -1;
 
 	if (s->entry_group == NULL) {
