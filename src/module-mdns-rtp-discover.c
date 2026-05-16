@@ -59,19 +59,20 @@ static const struct spa_dict_item module_props[] = {
 };
 
 struct impl;
+struct peer_card;
 
-/* Identity for a remote service: stable across drop/recover. */
+/* One Avahi service = one direction (sink OR source) of a peer card. */
 struct tunnel {
-	struct spa_list link;
-	struct impl *impl;
+	struct spa_list link;            /* into peer_card::tunnels */
+	struct spa_list impl_link;       /* into impl::tunnels (flat lookup) */
+	struct peer_card *card;
 
 	char *avahi_name;    /* Avahi service instance name */
-	char *peer_host;     /* from TXT or fallback host_name */
 	char *peer_node;     /* TXT node-name */
-	bool  is_sink_mode;  /* TXT mode=sink → we create local Audio/Sink */
+	bool  is_sink_mode;  /* TXT mode=sink → output direction */
 
 	/* Cached resolution payload so we can (re)create the rtp module
-	 * later, e.g. when a metadata toggle re-enables this peer. */
+	 * later when the profile flips back on. */
 	char *peer_addr;
 	uint16_t peer_port;
 	char *rate;
@@ -85,8 +86,20 @@ struct tunnel {
 
 	struct pw_impl_module *rtp_mod;
 	struct spa_hook rtp_mod_listener;
+};
 
-	/* Per-card SPA Device exposing Off/On profile. */
+/* Aggregates all directions of one peer card into a single PipeWire
+ * Audio/Device with an Off/On profile (will grow to Off/Output/
+ * Output+Input once we expose direction-aware profiles to WP). */
+struct peer_card {
+	struct spa_list link;
+	struct impl *impl;
+
+	char *peer_host;     /* TXT host */
+	char *card_name;     /* TXT card-name (grouping key) */
+	char *description;   /* user-facing label */
+
+	struct spa_list tunnels;   /* of struct tunnel via tunnel::link */
 	struct peer_device *device;
 };
 
@@ -126,11 +139,13 @@ struct impl {
 	double   ptime_ms;
 	uint32_t latency_ms;
 
-	struct spa_list tunnels;
+	struct spa_list tunnels;  /* flat list, impl_link */
+	struct spa_list cards;    /* of struct peer_card */
 };
 
 static int start_avahi_client(struct impl *impl);
 static void tunnel_free(struct tunnel *t);
+static void peer_card_free(struct peer_card *c);
 static int load_local_endpoint(struct tunnel *t,
 			       const char *peer_addr, uint16_t peer_port,
 			       const char *rate, const char *channels,
@@ -139,6 +154,18 @@ static int load_local_endpoint(struct tunnel *t,
 			       const char *transport,
 			       const char *multicast_ip,
 			       const char *multicast_ttl);
+
+static struct peer_card *find_card(struct impl *impl,
+				   const char *peer_host, const char *card_name)
+{
+	struct peer_card *c;
+	spa_list_for_each(c, &impl->cards, link) {
+		if (spa_streq(c->peer_host, peer_host) &&
+		    spa_streq(c->card_name, card_name))
+			return c;
+	}
+	return NULL;
+}
 
 /* -- helper: derive metadata-key-tail and lookup --------------------- */
 
@@ -159,9 +186,9 @@ static struct meta_entry *meta_find(struct impl *impl, const char *key_tail)
 	return NULL;
 }
 
-static bool is_enabled(struct impl *impl, const char *peer_host, const char *peer_node)
+static bool is_enabled(struct impl *impl, const char *peer_host, const char *card_name)
 {
-	char *kt = make_key_tail(peer_host, peer_node);
+	char *kt = make_key_tail(peer_host, card_name);
 	if (kt == NULL)
 		return true;
 	struct meta_entry *e = meta_find(impl, kt);
@@ -181,7 +208,7 @@ static void meta_entry_free(struct meta_entry *e)
 static struct tunnel *find_tunnel(struct impl *impl, const char *avahi_name)
 {
 	struct tunnel *t;
-	spa_list_for_each(t, &impl->tunnels, link)
+	spa_list_for_each(t, &impl->tunnels, impl_link)
 		if (spa_streq(t->avahi_name, avahi_name))
 			return t;
 	return NULL;
@@ -229,10 +256,7 @@ static void unload_local_endpoint(struct tunnel *t)
 	}
 }
 
-/* Bring the rtp child module into the requested state without touching
- * the SPA-device profile. Used by both the profile callback and the
- * metadata-change handler — whichever path comes first wins, the other
- * sees this as a no-op. */
+/* Bring the rtp child module into the requested state. */
 static void tunnel_set_loaded(struct tunnel *t, bool loaded)
 {
 	bool have = t->rtp_mod != NULL;
@@ -250,28 +274,30 @@ static void tunnel_set_loaded(struct tunnel *t, bool loaded)
 	}
 }
 
-/* Called by peer_device when the user picks a new profile via
- * pavucontrol / pw-cli set-param. Just (un)load the rtp module. */
-static int tunnel_profile_cb(void *user_data, bool on)
+/* Called by peer_device when the user picks a new profile. The Off/On
+ * state applies uniformly to all directions (sink + source) the card
+ * advertises. Future expansion: per-direction profile (Output vs
+ * Output+Input) — for that this would split into two booleans. */
+static int card_profile_cb(void *user_data, bool on)
 {
-	struct tunnel *t = user_data;
-	pw_log_info("profile change for '%s' → %s", t->avahi_name,
-		    on ? "On" : "Off");
-	tunnel_set_loaded(t, on);
+	struct peer_card *c = user_data;
+	struct tunnel *t;
+	pw_log_info("profile change for card '%s/%s' → %s",
+		    c->peer_host, c->card_name, on ? "On" : "Off");
+	spa_list_for_each(t, &c->tunnels, link)
+		tunnel_set_loaded(t, on);
 	return 0;
 }
 
-static void tunnel_apply_state(struct tunnel *t)
+static void card_apply_state(struct peer_card *c)
 {
-	bool want = is_enabled(t->impl, t->peer_host, t->peer_node);
-	/* Drive through the SPA Device so pavucontrol and metadata stay
-	 * coherent (peer_device_set_profile is a no-op if already in the
-	 * target state, and otherwise re-invokes tunnel_profile_cb which
-	 * actually loads/unloads). */
-	if (t->device) {
-		peer_device_set_profile(t->device, want);
-	} else {
-		tunnel_set_loaded(t, want);
+	bool want = is_enabled(c->impl, c->peer_host, c->card_name);
+	if (c->device)
+		peer_device_set_profile(c->device, want);
+	else {
+		struct tunnel *t;
+		spa_list_for_each(t, &c->tunnels, link)
+			tunnel_set_loaded(t, want);
 	}
 }
 
@@ -303,7 +329,7 @@ static int load_local_endpoint(struct tunnel *t,
 	bool is_multicast = transport && spa_streq(transport, "multicast")
 				&& multicast_ip != NULL;
 	const char *net_addr = is_multicast ? multicast_ip : peer_addr;
-	char *peer_host_safe = sanitize_for_node_name(t->peer_host);
+	char *peer_host_safe = sanitize_for_node_name(t->card->peer_host);
 	char *peer_node_safe = sanitize_for_node_name(t->peer_node);
 
 	if ((f = open_memstream(&args, &size)) == NULL) {
@@ -312,17 +338,17 @@ static int load_local_endpoint(struct tunnel *t,
 		return -errno;
 	}
 
-	uint32_t ssrc = fnv1a_32(t->peer_host, t->peer_node);
+	uint32_t ssrc = fnv1a_32(t->card->peer_host, t->peer_node);
 
 	char pbuf[PTIME_BUF_LEN];
-	spa_dtoa(pbuf, sizeof(pbuf), t->impl->ptime_ms);
+	spa_dtoa(pbuf, sizeof(pbuf), t->card->impl->ptime_ms);
 
 	if (t->is_sink_mode) {
 		child_mod = "libpipewire-module-rtp-sink";
 		fprintf(f, "{ ");
 		fprintf(f, "destination.ip = \"%s\" ", net_addr);
 		fprintf(f, "destination.port = %u ", peer_port);
-		fprintf(f, "sess.latency.msec = %u ", t->impl->latency_ms);
+		fprintf(f, "sess.latency.msec = %u ", t->card->impl->latency_ms);
 		if (is_multicast && multicast_ttl)
 			fprintf(f, "net.ttl = %s ", multicast_ttl);
 		fprintf(f, "sess.media = \"%s\" ",
@@ -334,7 +360,7 @@ static int load_local_endpoint(struct tunnel *t,
 		fprintf(f, "node.name = \"network.%s.%s\" ",
 			peer_host_safe, peer_node_safe);
 		fprintf(f, "node.description = \"Network: %s: %s\" ",
-			t->peer_host, description);
+			t->card->peer_host, description);
 		fprintf(f, "media.class = \"Audio/Sink\" ");
 		fprintf(f, "node.network = true ");
 		fprintf(f, "node.virtual = true ");
@@ -361,7 +387,7 @@ static int load_local_endpoint(struct tunnel *t,
 		fprintf(f, "{ ");
 		fprintf(f, "source.ip = \"%s\" ", net_addr);
 		fprintf(f, "source.port = %u ", peer_port);
-		fprintf(f, "sess.latency.msec = %u ", t->impl->latency_ms);
+		fprintf(f, "sess.latency.msec = %u ", t->card->impl->latency_ms);
 		fprintf(f, "sess.media = \"%s\" ",
 			spa_streq(codec, "opus") ? "opus" : "audio");
 		fprintf(f, "audio.format = \"%s\" ", format);
@@ -371,7 +397,7 @@ static int load_local_endpoint(struct tunnel *t,
 		fprintf(f, "node.name = \"network.%s.%s\" ",
 			peer_host_safe, peer_node_safe);
 		fprintf(f, "node.description = \"Network: %s: %s\" ",
-			t->peer_host, description);
+			t->card->peer_host, description);
 		fprintf(f, "media.class = \"Audio/Source\" ");
 		fprintf(f, "node.network = true ");
 		fprintf(f, "node.virtual = true ");
@@ -384,7 +410,7 @@ static int load_local_endpoint(struct tunnel *t,
 
 	pw_log_debug("loading %s: %s", child_mod, args);
 
-	t->rtp_mod = pw_context_load_module(t->impl->context,
+	t->rtp_mod = pw_context_load_module(t->card->impl->context,
 					    child_mod, args, NULL);
 	free(args);
 	free(peer_host_safe);
@@ -402,7 +428,7 @@ static int load_local_endpoint(struct tunnel *t,
 /* -- Avahi resolver --------------------------------------------------- */
 
 struct txt_kv {
-	char *node_name, *peer_host, *description, *mode;
+	char *node_name, *card_name, *peer_host, *description, *mode;
 	char *rate, *channels, *format, *codec;
 	char *transport, *mcast_ip, *mcast_ttl;
 };
@@ -410,6 +436,7 @@ struct txt_kv {
 static void txt_kv_free(struct txt_kv *kv)
 {
 	avahi_free(kv->node_name);
+	avahi_free(kv->card_name);
 	avahi_free(kv->peer_host);
 	avahi_free(kv->description);
 	avahi_free(kv->mode);
@@ -457,6 +484,7 @@ static void resolver_cb(AvahiServiceResolver *r,
 		}
 		char **slot = NULL;
 		if      (spa_streq(key, PWNZ_TXT_NODE_NAME))    slot = &kv.node_name;
+		else if (spa_streq(key, PWNZ_TXT_CARD_NAME))    slot = &kv.card_name;
 		else if (spa_streq(key, PWNZ_TXT_HOST))         slot = &kv.peer_host;
 		else if (spa_streq(key, PWNZ_TXT_DESCRIPTION))  slot = &kv.description;
 		else if (spa_streq(key, PWNZ_TXT_MODE))         slot = &kv.mode;
@@ -492,49 +520,65 @@ static void resolver_cb(AvahiServiceResolver *r,
 		pw_log_debug("'%s' already tracked", name);
 		goto done;
 	}
-	if (t == NULL) {
-		t = calloc(1, sizeof(*t));
-		if (t == NULL)
+
+	const char *peer_host = kv.peer_host ? kv.peer_host : host_name;
+	const char *peer_card_name = kv.card_name ? kv.card_name : kv.node_name;
+
+	/* Find or create the per-card aggregation. */
+	struct peer_card *card = find_card(impl, peer_host, peer_card_name);
+	if (card == NULL) {
+		card = calloc(1, sizeof(*card));
+		if (card == NULL)
 			goto done;
-		t->impl = impl;
-		t->avahi_name = strdup(name);
-		spa_list_append(&impl->tunnels, &t->link);
-	}
-	t->is_sink_mode = is_sink_mode;
-	free(t->peer_host);
-	t->peer_host = strdup(kv.peer_host ? kv.peer_host : host_name);
-	free(t->peer_node);
-	t->peer_node = strdup(kv.node_name);
+		card->impl = impl;
+		card->peer_host = strdup(peer_host);
+		card->card_name = strdup(peer_card_name);
+		card->description = strdup(kv.description ? kv.description :
+					   peer_card_name);
+		spa_list_init(&card->tunnels);
+		spa_list_append(&impl->cards, &card->link);
 
-	avahi_address_snprint(addr_buf, sizeof(addr_buf), a);
-
-	/* Create the SPA Device on first sighting so pavucontrol shows the
-	 * peer card in the Configuration tab with an Off/On profile. */
-	if (t->device == NULL) {
 		char node_name[256];
-		char *peer_host_safe = sanitize_for_node_name(t->peer_host);
-		char *peer_node_safe = sanitize_for_node_name(t->peer_node);
+		char *peer_host_safe = sanitize_for_node_name(card->peer_host);
+		char *card_safe = sanitize_for_node_name(card->card_name);
 		snprintf(node_name, sizeof(node_name), "network.%s.%s",
-			 peer_host_safe ? peer_host_safe : t->peer_host,
-			 peer_node_safe ? peer_node_safe : t->peer_node);
+			 peer_host_safe ? peer_host_safe : card->peer_host,
+			 card_safe ? card_safe : card->card_name);
 		free(peer_host_safe);
-		free(peer_node_safe);
+		free(card_safe);
 
 		char description[512];
 		snprintf(description, sizeof(description), "Network: %s: %s",
-			 t->peer_host, kv.description ? kv.description : kv.node_name);
+			 card->peer_host, card->description);
 
 		struct peer_device_info pdi = {
 			.node_name        = node_name,
 			.node_description = description,
-			.peer_host        = t->peer_host,
-			.default_on       = is_enabled(impl, t->peer_host, t->peer_node),
+			.peer_host        = card->peer_host,
+			.default_on       = is_enabled(impl, card->peer_host,
+						       card->card_name),
 		};
-		t->device = peer_device_new(impl->context, &pdi,
-					    tunnel_profile_cb, t);
-		if (t->device == NULL)
-			pw_log_warn("peer_device_new failed for '%s': %m", name);
+		card->device = peer_device_new(impl->context, &pdi,
+					       card_profile_cb, card);
+		if (card->device == NULL)
+			pw_log_warn("peer_device_new failed for card '%s/%s': %m",
+				    card->peer_host, card->card_name);
 	}
+
+	if (t == NULL) {
+		t = calloc(1, sizeof(*t));
+		if (t == NULL)
+			goto done;
+		t->card = card;
+		t->avahi_name = strdup(name);
+		spa_list_append(&impl->tunnels, &t->impl_link);
+		spa_list_append(&card->tunnels, &t->link);
+	}
+	t->is_sink_mode = is_sink_mode;
+	free(t->peer_node);
+	t->peer_node = strdup(kv.node_name);
+
+	avahi_address_snprint(addr_buf, sizeof(addr_buf), a);
 
 	/* Cache resolution payload so the metadata-toggle path can re-load
 	 * later. Old values freed first. */
@@ -553,7 +597,7 @@ static void resolver_cb(AvahiServiceResolver *r,
 	#undef REPLACE_OPT
 	t->peer_port = port;
 
-	if (is_enabled(impl, t->peer_host, t->peer_node)) {
+	if (is_enabled(impl, card->peer_host, card->card_name)) {
 		tunnel_set_loaded(t, true);
 	} else {
 		pw_log_info("'%s' disabled by metadata — not loading", name);
@@ -612,14 +656,11 @@ static void browser_cb(AvahiServiceBrowser *b SPA_UNUSED,
 
 static void tunnel_free(struct tunnel *t)
 {
-	spa_list_remove(&t->link);
+	struct peer_card *card = t->card;
+	spa_list_remove(&t->link);        /* off peer_card::tunnels */
+	spa_list_remove(&t->impl_link);   /* off impl::tunnels */
 	unload_local_endpoint(t);
-	if (t->device) {
-		peer_device_destroy(t->device);
-		t->device = NULL;
-	}
 	free(t->avahi_name);
-	free(t->peer_host);
 	free(t->peer_node);
 	free(t->peer_addr);
 	free(t->rate);
@@ -631,6 +672,42 @@ static void tunnel_free(struct tunnel *t)
 	free(t->multicast_ip);
 	free(t->multicast_ttl);
 	free(t);
+
+	/* When a card loses its last tunnel, also destroy its SPA device
+	 * — there's nothing to publish for it any more. */
+	if (card && spa_list_is_empty(&card->tunnels))
+		peer_card_free(card);
+}
+
+static void peer_card_free(struct peer_card *c)
+{
+	if (c == NULL)
+		return;
+	struct tunnel *t;
+	spa_list_consume(t, &c->tunnels, link) {
+		t->card = NULL;          /* prevent recursion via tunnel_free */
+		spa_list_remove(&t->impl_link);
+		unload_local_endpoint(t);
+		free(t->avahi_name);
+		free(t->peer_node);
+		free(t->peer_addr);
+		free(t->rate);
+		free(t->channels);
+		free(t->format);
+		free(t->codec);
+		free(t->description);
+		free(t->transport);
+		free(t->multicast_ip);
+		free(t->multicast_ttl);
+		free(t);
+	}
+	if (c->device)
+		peer_device_destroy(c->device);
+	spa_list_remove(&c->link);
+	free(c->peer_host);
+	free(c->card_name);
+	free(c->description);
+	free(c);
 }
 
 /* -- Avahi client state ----------------------------------------------- */
@@ -691,18 +768,7 @@ static int start_avahi_client(struct impl *impl)
 
 /* -- metadata events -------------------------------------------------- */
 
-static struct tunnel *find_tunnel_by_peer(struct impl *impl,
-					  const char *peer_host,
-					  const char *peer_node)
-{
-	struct tunnel *t;
-	spa_list_for_each(t, &impl->tunnels, link) {
-		if (spa_streq(t->peer_host, peer_host) &&
-		    spa_streq(t->peer_node, peer_node))
-			return t;
-	}
-	return NULL;
-}
+/* (no longer needed — metadata path acts on peer_card via find_card) */
 
 static int meta_property(void *data, uint32_t subject,
 			 const char *key, const char *type SPA_UNUSED,
@@ -752,13 +818,13 @@ static int meta_property(void *data, uint32_t subject,
 		pw_log_info("metadata: %s = %s", kt, en ? "true" : "false");
 	}
 
-	/* Now split and re-evaluate the matching tunnel. */
+	/* Now split kt = "peer_host.card_name" and re-evaluate the card. */
 	*dot = '\0';
 	const char *peer_host = kt;
-	const char *peer_node = dot + 1;
-	struct tunnel *t = find_tunnel_by_peer(impl, peer_host, peer_node);
-	if (t != NULL)
-		tunnel_apply_state(t);
+	const char *card_name = dot + 1;
+	struct peer_card *c = find_card(impl, peer_host, card_name);
+	if (c != NULL)
+		card_apply_state(c);
 
 	free(kt);
 	return 0;
@@ -847,11 +913,11 @@ static const struct pw_proxy_events core_proxy_events = {
 
 static void impl_free(struct impl *impl)
 {
-	struct tunnel *t;
+	struct peer_card *c;
 	struct meta_entry *e;
 
-	spa_list_consume(t, &impl->tunnels, link)
-		tunnel_free(t);
+	spa_list_consume(c, &impl->cards, link)
+		peer_card_free(c);
 	spa_list_consume(e, &impl->meta_entries, link)
 		meta_entry_free(e);
 
@@ -921,6 +987,7 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	impl->props = props;
 	impl->metadata_id = SPA_ID_INVALID;
 	spa_list_init(&impl->tunnels);
+	spa_list_init(&impl->cards);
 	spa_list_init(&impl->meta_entries);
 
 	impl->discover_sink   = pw_properties_get_bool(props, "discover.sink",   true);

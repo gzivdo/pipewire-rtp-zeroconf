@@ -87,6 +87,7 @@ struct service {
 	uint32_t node_id;
 	char *node_name;
 	char *node_description;
+	char *card_name;     /* stable per-card identifier for grouping */
 	bool is_sink;
 	uint32_t channels;
 
@@ -394,10 +395,15 @@ static void registry_global(void *data, uint32_t id,
 	if (s == NULL)
 		return;
 
+	const char *card = spa_dict_lookup(props, PW_KEY_DEVICE_NAME);
+	if (card == NULL)
+		card = node_name;
+
 	s->impl = impl;
 	s->node_id = id;
 	s->node_name = strdup(node_name);
 	s->node_description = strdup(desc);
+	s->card_name = strdup(card);
 	s->is_sink = is_sink;
 	s->channels = channels;
 	s->port = port;
@@ -637,6 +643,7 @@ static AvahiStringList *build_txt(struct service *s)
 	char buf[256];
 
 	t = avahi_string_list_add_pair(t, PWNZ_TXT_NODE_NAME, s->node_name);
+	t = avahi_string_list_add_pair(t, PWNZ_TXT_CARD_NAME, s->card_name);
 	t = avahi_string_list_add_pair(t, PWNZ_TXT_DESCRIPTION, s->node_description);
 	t = avahi_string_list_add_pair(t, PWNZ_TXT_HOST, impl->host_name);
 	snprintf(buf, sizeof(buf), "%u", impl->rate);
@@ -821,6 +828,7 @@ static void service_free(struct service *s)
 	unpublish_service(s);
 	free(s->node_name);
 	free(s->node_description);
+	free(s->card_name);
 	free(s);
 }
 

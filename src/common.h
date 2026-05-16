@@ -21,6 +21,14 @@
 #define PWNZ_TXT_TRANSPORT    "transport"   /* "unicast" or "multicast" */
 #define PWNZ_TXT_MCAST_IP     "multicast-ip"
 #define PWNZ_TXT_MCAST_TTL    "multicast-ttl"
+/* Stable identifier of the underlying audio card.
+ * Two services from the same peer host with the same card-name are
+ * different directions (sink+source) of the *same* card and should be
+ * presented as one device with output/input profile on the discover
+ * side. Derived from PW_KEY_DEVICE_NAME on publish side; falls back to
+ * PW_KEY_NODE_NAME for orphan virtual nodes that have no parent
+ * device. */
+#define PWNZ_TXT_CARD_NAME    "card-name"
 
 #define PWNZ_DEFAULT_RATE       48000u
 #define PWNZ_DEFAULT_CHANNELS   2u

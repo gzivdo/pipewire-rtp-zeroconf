@@ -267,19 +267,21 @@ local `node.name` with `wpctl status` or `pactl list short sinks`.
 ### Disable / enable a discovered remote card on the discover side
 
 ```bash
-# stop creating a local virtual sink for a specific peer card
-# (the rtp-sink child is unloaded; the sink disappears from pavucontrol):
-pw-metadata 0 "pipewire-net-zeroconf.discover.<peer-host>.<peer-node-name>.enabled" "false"
+# stop creating local virtual nodes for a specific peer card
+# (every direction belonging to this card is unloaded — output and
+# input together, since the card is the unit of toggle):
+pw-metadata 0 "pipewire-net-zeroconf.discover.<peer-host>.<peer-card-name>.enabled" "false"
 
 # re-enable:
-pw-metadata 0 "pipewire-net-zeroconf.discover.<peer-host>.<peer-node-name>.enabled" "true"
+pw-metadata 0 "pipewire-net-zeroconf.discover.<peer-host>.<peer-card-name>.enabled" "true"
 ```
 
 The key parts come from the TXT records of the published service:
-`<peer-host>` is the publishing machine's hostname, `<peer-node-name>` is
-the remote card's `node.name`. You can read both from
-`avahi-browse -r _pipewire-rtp._udp` (look at the `host` and `node-name`
-TXT entries).
+`<peer-host>` is the publishing machine's hostname, `<peer-card-name>`
+is the remote card's identifier (the `card-name` TXT field; defaults
+to the node's `node.name` when no parent PipeWire device exists, e.g.
+for virtual loopback sinks). Read both from
+`avahi-browse -r _pipewire-rtp._udp`.
 
 ### Listing current toggle state
 
@@ -298,12 +300,21 @@ future iteration.
 
 ## pavucontrol Card view (experimental)
 
-Each discovered remote card is also exposed as a native PipeWire
-`Audio/Device` with `device.api = network-rtp` and an Off/On
-`SPA_PARAM_EnumProfile`. WirePlumber picks the device up automatically,
-so on most desktops the peer cards show up in pavucontrol's
-**Configuration** tab right next to local cards, in the
+Each peer **card** — a set of sink + source directions that share the
+same underlying audio device on the publishing host — is exposed as a
+single native PipeWire `Audio/Device` with `device.api = network-rtp`
+and an Off/On `SPA_PARAM_EnumProfile`. WirePlumber picks the device
+up automatically, so on most desktops the peer cards show up in
+pavucontrol's **Configuration** tab right next to local cards, in the
 GNOME / KDE sound panels, and in `wpctl status`.
+
+Grouping is driven by the `card-name` TXT field which the publish
+side derives from each node's parent `device.name`. Two services with
+different node names (e.g. `alsa_output.pci-…` and
+`alsa_input.pci-…`) that share the same parent device end up under
+one card on the discover side; orphan virtual nodes that have no
+parent (a `module-loopback` sink, say) fall back to their `node.name`
+and appear as their own card.
 
 What works today:
 
