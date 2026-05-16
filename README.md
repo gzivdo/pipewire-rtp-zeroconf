@@ -65,15 +65,93 @@ drop-in confs to `/usr/share/pipewire/pipewire.conf.d/`.
 
 ## Firewall
 
-Open UDP **46000–46031** in both directions on every host running publish.
-That covers the default `publish.port.range = 32`. Multicast (`publish.transport
-= multicast`) also needs IGMP to pass through any L3 hop. iptables example:
+Two things to allow on **both** hosts (publish *and* discover sides need
+mDNS to work):
+
+- **UDP 5353** — mDNS / Avahi. The protocol is symmetric multicast:
+  every host both listens for and sends queries / responses on this port.
+  Allow it **inbound on every host**; outbound is usually permitted by
+  default. (Port 5354 — unicast DNS-SD — is **not** needed for our use
+  case; if you opened it on a previous setup you can close it.)
+- **UDP 46000–46031** — the audio RTP ports allocated by `publish.port.range
+  = 32` (default). Allow them **inbound on the publish host(s) only**; the
+  discover host opens an ephemeral outbound socket for sending and does
+  not need an inbound hole here.
+
+iptables example on a publish host:
 
 ```bash
+iptables -A INPUT -p udp -i <lan-iface> --dport 5353 -j ACCEPT
 iptables -A INPUT -p udp -i <lan-iface> --dport 46000:46031 -j ACCEPT
 ```
 
-If you raise `publish.port.range`, widen the rule accordingly.
+On a discover-only host (apps, no speakers) you only need 5353:
+
+```bash
+iptables -A INPUT -p udp -i <lan-iface> --dport 5353 -j ACCEPT
+```
+
+If you raise `publish.port.range` widen the second rule; if you switch
+to `publish.transport = multicast` you may additionally need to allow
+IGMP through any L3 hop (most home/office LANs are flat L2 and do not
+need this).
+
+## Migrating from the legacy PulseAudio zeroconf
+
+If your hosts previously used `module-zeroconf-discover` /
+`module-zeroconf-publish` (either the PulseAudio modules or the PipeWire
+`libpulse`-based wrappers), **turn those off first** — otherwise both
+stacks will publish/consume audio at the same time and you will get
+duplicated sinks in pavucontrol, two competing tunnels per peer, and
+extra LAN traffic.
+
+### PulseAudio (`pulseaudio.service` is the audio server)
+
+Edit `/etc/pulse/default.pa` (or `~/.config/pulse/default.pa` for a
+per-user override) and comment out / remove:
+
+```
+load-module module-zeroconf-discover
+load-module module-zeroconf-publish
+```
+
+Then `systemctl --user restart pulseaudio` (or `pulseaudio -k`).
+`apt purge pulseaudio-module-zeroconf` if you want to remove the
+package entirely.
+
+### PipeWire-only host (pipewire-pulse provides PA compatibility)
+
+The upstream `libpipewire-module-zeroconf-discover` / `-publish` are
+**not** loaded by default in any of Ubuntu's `pipewire.conf` /
+`pipewire-pulse.conf` shipped configs, so there is usually nothing to
+remove. To be sure:
+
+```bash
+# nothing should reference the legacy modules:
+grep -rE 'zeroconf-discover|zeroconf-publish' \
+    /etc/pipewire/ /usr/share/pipewire/ ~/.config/pipewire/ 2>/dev/null
+```
+
+If you ever ran `pactl load-module module-zeroconf-discover` or
+`module-zeroconf-publish` manually, unload them:
+
+```bash
+pactl unload-module module-zeroconf-discover  2>/dev/null
+pactl unload-module module-zeroconf-publish   2>/dev/null
+```
+
+…or just restart `pipewire-pulse`:
+
+```bash
+systemctl --user restart pipewire-pulse
+```
+
+The new service type used here (`_pipewire-rtp._udp`) is intentionally
+different from the legacy `_pulse-sink._tcp` / `_pulse-source._tcp` so
+the two stacks can coexist during migration without confusing each
+other's discovery — but you should still disable the old one once
+you're satisfied with the new setup, to keep one source of truth and
+free up the CPU/network cost of the libpulse tunnels.
 
 ## Options reference
 
@@ -549,3 +627,10 @@ Everything is native PipeWire and **no `libpulse` anywhere**:
 ## License
 
 MIT. See `debian/copyright`.
+
+## Authors
+
+- [gzivdo](https://github.com/gzivdo) — design, requirements, testing,
+  bug reports against real-world LAN setups.
+- Claude Opus 4.7 (Anthropic) — implementation under gzivdo's guidance.
+  See per-commit `Co-Authored-By` trailers for attribution.
