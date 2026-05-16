@@ -1,11 +1,7 @@
 /* SPDX-License-Identifier: MIT
  *
- * Per-peer-card SPA Device with Off/On profile, registered into the
- * local PipeWire context so pavucontrol Configuration tab shows the
- * card with a profile dropdown.
- *
- * Modelled after spa/plugins/jack/jack-device.c (the smallest upstream
- * SPA device that ships profile-aware enum_params/set_param).
+ * Per-peer-card SPA Device with a direction-aware profile dropdown.
+ * Modelled after spa/plugins/jack/jack-device.c.
  */
 
 #include <errno.h>
@@ -30,40 +26,74 @@
 
 #include "peer-device.h"
 
+/* Profile slots — fixed table, we just filter by `available_dirs`. */
+struct profile_def {
+	const char *name;
+	const char *description;
+	uint32_t needs;   /* exact directions this profile activates */
+	int priority;
+};
+
+static const struct profile_def PROFILES[] = {
+	{ "off",          "Off",            0,                                  0 },
+	{ "output",       "Output",         PEER_DIR_OUTPUT,                  100 },
+	{ "input",        "Input",          PEER_DIR_INPUT,                    90 },
+	{ "output+input", "Output + Input", PEER_DIR_OUTPUT | PEER_DIR_INPUT, 110 },
+};
+#define N_PROFILES (sizeof(PROFILES) / sizeof(PROFILES[0]))
+
 struct peer_device {
-	/* SPA device exposed to PipeWire. */
 	struct spa_device device;
 	struct spa_hook_list hooks;
 
-	/* Owned by us. */
 	char *node_name;
 	char *node_description;
 	char *peer_host;
-	uint32_t profile;       /* 0 = Off, 1 = On */
+	uint32_t available_dirs;
+	uint32_t active_dirs;
 
 	peer_device_profile_cb cb;
 	void *cb_user_data;
 
-	/* Registered impl. */
 	struct pw_impl_device *impl_device;
 };
 
-/* -- SPA Device implementation ---------------------------------------- */
+/* -- helpers ---------------------------------------------------------- */
 
-static int emit_info(struct peer_device *this, bool full)
+static bool profile_is_offered(const struct peer_device *this,
+			       const struct profile_def *p)
+{
+	/* "Off" is always available. Other profiles must match the card's
+	 * available directions exactly — we don't let the user pick a
+	 * profile that needs a direction the peer doesn't offer. */
+	if (p->needs == 0)
+		return true;
+	return (p->needs & ~this->available_dirs) == 0;
+}
+
+static int find_profile_by_dirs(const struct peer_device *this, uint32_t dirs)
+{
+	for (size_t i = 0; i < N_PROFILES; i++) {
+		if (PROFILES[i].needs == dirs && profile_is_offered(this, &PROFILES[i]))
+			return (int) i;
+	}
+	return -1;
+}
+
+/* -- SPA Device impl -------------------------------------------------- */
+
+static int emit_info(struct peer_device *this)
 {
 	struct spa_dict_item items[10];
 	struct spa_device_info dinfo = SPA_DEVICE_INFO_INIT();
 	struct spa_param_info params[2];
 	int n = 0;
-	(void) full;
 
 	items[n++] = SPA_DICT_ITEM_INIT(SPA_KEY_DEVICE_API,         "network-rtp");
 	items[n++] = SPA_DICT_ITEM_INIT(SPA_KEY_DEVICE_NICK,        this->node_name);
 	items[n++] = SPA_DICT_ITEM_INIT(SPA_KEY_DEVICE_NAME,        this->node_name);
 	items[n++] = SPA_DICT_ITEM_INIT(SPA_KEY_DEVICE_DESCRIPTION, this->node_description);
 	items[n++] = SPA_DICT_ITEM_INIT(SPA_KEY_MEDIA_CLASS,        "Audio/Device");
-	items[n++] = SPA_DICT_ITEM_INIT("device.intended-roles",    "Music");
 	items[n++] = SPA_DICT_ITEM_INIT("pipewire-net-zeroconf.peer.host", this->peer_host);
 
 	dinfo.change_mask = SPA_DEVICE_CHANGE_MASK_PROPS |
@@ -82,36 +112,29 @@ static int emit_info(struct peer_device *this, bool full)
 	return 0;
 }
 
-static struct spa_pod *build_profile(struct peer_device *this SPA_UNUSED,
+static struct spa_pod *build_profile(struct peer_device *this,
 				     struct spa_pod_builder *b,
-				     uint32_t id, uint32_t index)
+				     uint32_t id, int profile_idx)
 {
+	const struct profile_def *p;
 	struct spa_pod_frame f;
-	const char *name, *desc;
-	int prio;
 
-	switch (index) {
-	case 0:
-		name = "off";
-		desc = "Off";
-		prio = 0;
-		break;
-	case 1:
-		name = "on";
-		desc = "On";
-		prio = 1;
-		break;
-	default:
+	if (profile_idx < 0 || (size_t) profile_idx >= N_PROFILES) {
 		errno = EINVAL;
 		return NULL;
 	}
+	p = &PROFILES[profile_idx];
 
 	spa_pod_builder_push_object(b, &f, SPA_TYPE_OBJECT_ParamProfile, id);
 	spa_pod_builder_add(b,
-		SPA_PARAM_PROFILE_index,       SPA_POD_Int(index),
-		SPA_PARAM_PROFILE_name,        SPA_POD_String(name),
-		SPA_PARAM_PROFILE_description, SPA_POD_String(desc),
-		SPA_PARAM_PROFILE_priority,    SPA_POD_Int(prio),
+		SPA_PARAM_PROFILE_index,       SPA_POD_Int(profile_idx),
+		SPA_PARAM_PROFILE_name,        SPA_POD_String(p->name),
+		SPA_PARAM_PROFILE_description, SPA_POD_String(p->description),
+		SPA_PARAM_PROFILE_priority,    SPA_POD_Int(p->priority),
+		SPA_PARAM_PROFILE_available,
+			SPA_POD_Id(profile_is_offered(this, p)
+				   ? SPA_PARAM_AVAILABILITY_yes
+				   : SPA_PARAM_AVAILABILITY_no),
 		0);
 	return spa_pod_builder_pop(b, &f);
 }
@@ -123,7 +146,7 @@ static int impl_add_listener(void *object, struct spa_hook *listener,
 	struct spa_hook_list save;
 	spa_hook_list_isolate(&this->hooks, &save, listener, events, data);
 	if (events->info)
-		emit_info(this, true);
+		emit_info(this);
 	spa_hook_list_join(&this->hooks, &save);
 	return 0;
 }
@@ -155,18 +178,30 @@ next:
 
 	switch (id) {
 	case SPA_PARAM_EnumProfile:
-		if (result.index >= 2)
+		/* Walk all profiles, skip ones we don't offer. */
+		while (result.index < N_PROFILES &&
+		       !profile_is_offered(this, &PROFILES[result.index]))
+			result.index = result.next++;
+		if (result.index >= N_PROFILES)
 			return 0;
-		param = build_profile(this, &b, id, result.index);
+		param = build_profile(this, &b, id, (int) result.index);
 		break;
 	case SPA_PARAM_Profile:
 		if (result.index >= 1)
 			return 0;
-		param = build_profile(this, &b, id, this->profile);
+		{
+			int idx = find_profile_by_dirs(this, this->active_dirs);
+			if (idx < 0)
+				idx = 0;
+			param = build_profile(this, &b, id, idx);
+		}
 		break;
 	default:
 		return -ENOENT;
 	}
+
+	if (param == NULL)
+		return -errno;
 
 	if (spa_pod_filter(&b, &result.param, param, filter) < 0)
 		goto next;
@@ -178,8 +213,7 @@ next:
 	return 0;
 }
 
-static int impl_set_param(void *object,
-			  uint32_t id, uint32_t flags,
+static int impl_set_param(void *object, uint32_t id, uint32_t flags,
 			  const struct spa_pod *param)
 {
 	struct peer_device *this = object;
@@ -188,24 +222,24 @@ static int impl_set_param(void *object,
 	if (id != SPA_PARAM_Profile)
 		return -ENOENT;
 
-	uint32_t idx;
+	int32_t idx;
 	if (spa_pod_parse_object(param,
 			SPA_TYPE_OBJECT_ParamProfile, NULL,
 			SPA_PARAM_PROFILE_index, SPA_POD_Int(&idx)) < 0)
 		return -EINVAL;
-	if (idx > 1)
+	if (idx < 0 || (size_t) idx >= N_PROFILES)
+		return -EINVAL;
+	if (!profile_is_offered(this, &PROFILES[idx]))
 		return -EINVAL;
 
-	bool new_on = (idx == 1);
-	bool cur_on = (this->profile == 1);
-	if (new_on == cur_on)
+	uint32_t new_dirs = PROFILES[idx].needs;
+	if (new_dirs == this->active_dirs)
 		return 0;
 
-	this->profile = idx;
-	emit_info(this, false);
-
+	this->active_dirs = new_dirs;
+	emit_info(this);
 	if (this->cb)
-		this->cb(this->cb_user_data, new_on);
+		this->cb(this->cb_user_data, new_dirs);
 	return 0;
 }
 
@@ -231,7 +265,8 @@ struct peer_device *peer_device_new(struct pw_context *context,
 	dev->node_name        = strdup(info->node_name);
 	dev->node_description = strdup(info->node_description);
 	dev->peer_host        = strdup(info->peer_host);
-	dev->profile          = info->default_on ? 1 : 0;
+	dev->available_dirs   = info->available_dirs;
+	dev->active_dirs      = info->default_dirs & info->available_dirs;
 	dev->cb               = cb;
 	dev->cb_user_data     = user_data;
 
@@ -293,21 +328,39 @@ uint32_t peer_device_get_id(struct peer_device *dev)
 	return g ? pw_global_get_id(g) : SPA_ID_INVALID;
 }
 
-int peer_device_set_profile(struct peer_device *dev, bool on)
+int peer_device_set_active_dirs(struct peer_device *dev, uint32_t active_dirs)
 {
 	if (dev == NULL)
 		return -EINVAL;
-	uint32_t new_idx = on ? 1 : 0;
-	if (dev->profile == new_idx)
+	if (active_dirs & ~dev->available_dirs)
+		return -EINVAL;
+	if (active_dirs == dev->active_dirs)
 		return 0;
-	dev->profile = new_idx;
-	emit_info(dev, false);
+	dev->active_dirs = active_dirs;
+	emit_info(dev);
 	if (dev->cb)
-		dev->cb(dev->cb_user_data, on);
+		dev->cb(dev->cb_user_data, active_dirs);
 	return 0;
 }
 
-bool peer_device_is_on(struct peer_device *dev)
+uint32_t peer_device_get_active_dirs(struct peer_device *dev)
 {
-	return dev && dev->profile == 1;
+	return dev ? dev->active_dirs : 0;
+}
+
+int peer_device_set_available_dirs(struct peer_device *dev,
+				   uint32_t available_dirs)
+{
+	if (dev == NULL)
+		return -EINVAL;
+	if (available_dirs == dev->available_dirs)
+		return 0;
+	dev->available_dirs = available_dirs;
+	uint32_t clamped = dev->active_dirs & available_dirs;
+	bool dirs_changed = (clamped != dev->active_dirs);
+	dev->active_dirs = clamped;
+	emit_info(dev);
+	if (dirs_changed && dev->cb)
+		dev->cb(dev->cb_user_data, clamped);
+	return 0;
 }

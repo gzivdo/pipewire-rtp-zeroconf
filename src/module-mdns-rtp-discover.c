@@ -89,8 +89,8 @@ struct tunnel {
 };
 
 /* Aggregates all directions of one peer card into a single PipeWire
- * Audio/Device with an Off/On profile (will grow to Off/Output/
- * Output+Input once we expose direction-aware profiles to WP). */
+ * Audio/Device with a direction-aware profile dropdown
+ * (Off / Output / Output+Input / Input as available). */
 struct peer_card {
 	struct spa_list link;
 	struct impl *impl;
@@ -98,6 +98,8 @@ struct peer_card {
 	char *peer_host;     /* TXT host */
 	char *card_name;     /* TXT card-name (grouping key) */
 	char *description;   /* user-facing label */
+
+	uint32_t available_dirs;   /* OR of PEER_DIR_* the card actually offers */
 
 	struct spa_list tunnels;   /* of struct tunnel via tunnel::link */
 	struct peer_device *device;
@@ -274,30 +276,49 @@ static void tunnel_set_loaded(struct tunnel *t, bool loaded)
 	}
 }
 
-/* Called by peer_device when the user picks a new profile. The Off/On
- * state applies uniformly to all directions (sink + source) the card
- * advertises. Future expansion: per-direction profile (Output vs
- * Output+Input) — for that this would split into two booleans. */
-static int card_profile_cb(void *user_data, bool on)
+/* Called by peer_device when the user picks a new profile via
+ * pavucontrol / pw-cli set-param. active_dirs is the bitmask of the
+ * directions the user wants on: 0 = Off, OUTPUT = playback only,
+ * OUTPUT|INPUT = duplex, etc. Load/unload each tunnel based on its
+ * direction matching the mask. */
+static int card_profile_cb(void *user_data, uint32_t active_dirs)
 {
 	struct peer_card *c = user_data;
 	struct tunnel *t;
-	pw_log_info("profile change for card '%s/%s' → %s",
-		    c->peer_host, c->card_name, on ? "On" : "Off");
-	spa_list_for_each(t, &c->tunnels, link)
-		tunnel_set_loaded(t, on);
+	pw_log_info("profile change for card '%s/%s' → 0x%x (output=%d input=%d)",
+		    c->peer_host, c->card_name, active_dirs,
+		    !!(active_dirs & PEER_DIR_OUTPUT),
+		    !!(active_dirs & PEER_DIR_INPUT));
+	spa_list_for_each(t, &c->tunnels, link) {
+		uint32_t need = t->is_sink_mode ? PEER_DIR_OUTPUT : PEER_DIR_INPUT;
+		tunnel_set_loaded(t, (active_dirs & need) != 0);
+	}
 	return 0;
+}
+
+static uint32_t card_default_dirs(struct peer_card *c)
+{
+	struct impl *impl = c->impl;
+	uint32_t want = 0;
+	if (impl->discover_sink   && (c->available_dirs & PEER_DIR_OUTPUT))
+		want |= PEER_DIR_OUTPUT;
+	if (impl->discover_source && (c->available_dirs & PEER_DIR_INPUT))
+		want |= PEER_DIR_INPUT;
+	return want;
 }
 
 static void card_apply_state(struct peer_card *c)
 {
-	bool want = is_enabled(c->impl, c->peer_host, c->card_name);
+	bool en = is_enabled(c->impl, c->peer_host, c->card_name);
+	uint32_t want = en ? card_default_dirs(c) : 0;
 	if (c->device)
-		peer_device_set_profile(c->device, want);
+		peer_device_set_active_dirs(c->device, want);
 	else {
 		struct tunnel *t;
-		spa_list_for_each(t, &c->tunnels, link)
-			tunnel_set_loaded(t, want);
+		spa_list_for_each(t, &c->tunnels, link) {
+			uint32_t need = t->is_sink_mode ? PEER_DIR_OUTPUT : PEER_DIR_INPUT;
+			tunnel_set_loaded(t, (want & need) != 0);
+		}
 	}
 }
 
@@ -523,10 +544,12 @@ static void resolver_cb(AvahiServiceResolver *r,
 
 	const char *peer_host = kv.peer_host ? kv.peer_host : host_name;
 	const char *peer_card_name = kv.card_name ? kv.card_name : kv.node_name;
+	uint32_t new_dir = is_sink_mode ? PEER_DIR_OUTPUT : PEER_DIR_INPUT;
 
 	/* Find or create the per-card aggregation. */
 	struct peer_card *card = find_card(impl, peer_host, peer_card_name);
-	if (card == NULL) {
+	bool card_is_new = (card == NULL);
+	if (card_is_new) {
 		card = calloc(1, sizeof(*card));
 		if (card == NULL)
 			goto done;
@@ -537,7 +560,13 @@ static void resolver_cb(AvahiServiceResolver *r,
 					   peer_card_name);
 		spa_list_init(&card->tunnels);
 		spa_list_append(&impl->cards, &card->link);
+	}
 
+	uint32_t new_avail = card->available_dirs | new_dir;
+	bool avail_changed = (new_avail != card->available_dirs);
+	card->available_dirs = new_avail;
+
+	if (card_is_new) {
 		char node_name[256];
 		char *peer_host_safe = sanitize_for_node_name(card->peer_host);
 		char *card_safe = sanitize_for_node_name(card->card_name);
@@ -555,14 +584,19 @@ static void resolver_cb(AvahiServiceResolver *r,
 			.node_name        = node_name,
 			.node_description = description,
 			.peer_host        = card->peer_host,
-			.default_on       = is_enabled(impl, card->peer_host,
-						       card->card_name),
+			.available_dirs   = card->available_dirs,
+			.default_dirs     = is_enabled(impl, card->peer_host,
+						       card->card_name)
+						? card_default_dirs(card) : 0,
 		};
 		card->device = peer_device_new(impl->context, &pdi,
 					       card_profile_cb, card);
 		if (card->device == NULL)
 			pw_log_warn("peer_device_new failed for card '%s/%s': %m",
 				    card->peer_host, card->card_name);
+	} else if (avail_changed && card->device) {
+		/* second direction service appeared — refresh profile list */
+		peer_device_set_available_dirs(card->device, card->available_dirs);
 	}
 
 	if (t == NULL) {
@@ -597,10 +631,13 @@ static void resolver_cb(AvahiServiceResolver *r,
 	#undef REPLACE_OPT
 	t->peer_port = port;
 
-	if (is_enabled(impl, card->peer_host, card->card_name)) {
+	/* Apply current desired state for this direction. Profile-on +
+	 * direction in active_dirs ⇒ load, else don't. */
+	if (card->device) {
+		uint32_t active = peer_device_get_active_dirs(card->device);
+		tunnel_set_loaded(t, (active & new_dir) != 0);
+	} else if (is_enabled(impl, card->peer_host, card->card_name)) {
 		tunnel_set_loaded(t, true);
-	} else {
-		pw_log_info("'%s' disabled by metadata — not loading", name);
 	}
 
 done:
@@ -673,10 +710,22 @@ static void tunnel_free(struct tunnel *t)
 	free(t->multicast_ttl);
 	free(t);
 
-	/* When a card loses its last tunnel, also destroy its SPA device
-	 * — there's nothing to publish for it any more. */
-	if (card && spa_list_is_empty(&card->tunnels))
+	if (card == NULL)
+		return;
+	if (spa_list_is_empty(&card->tunnels)) {
 		peer_card_free(card);
+	} else {
+		/* Recompute available_dirs from whatever remains. */
+		uint32_t avail = 0;
+		struct tunnel *r;
+		spa_list_for_each(r, &card->tunnels, link)
+			avail |= r->is_sink_mode ? PEER_DIR_OUTPUT : PEER_DIR_INPUT;
+		if (avail != card->available_dirs) {
+			card->available_dirs = avail;
+			if (card->device)
+				peer_device_set_available_dirs(card->device, avail);
+		}
+	}
 }
 
 static void peer_card_free(struct peer_card *c)
