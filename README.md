@@ -168,6 +168,7 @@ two stacked module loads.
 |---|---|---|
 | `publish.sink` | `true` | publish local `Audio/Sink` nodes to the LAN |
 | `publish.source` | `false` | publish local `Audio/Source` (mic) too — **opt-in** |
+| `publish.rules` | unset | per-card match rules — see [Per-card filtering](#per-card-filtering) below |
 | `publish.rate` | `48000` | sample rate advertised in TXT and used by the RTP receiver |
 | `publish.channels` | `2` | channel count advertised |
 | `publish.format` | `"S16BE"` | wire format. `S16BE` \| `S24BE` \| `S32BE` |

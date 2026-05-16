@@ -24,6 +24,7 @@
 
 #include <pipewire/pipewire.h>
 #include <pipewire/impl.h>
+#include <pipewire/conf.h>
 
 #include <avahi-client/client.h>
 #include <avahi-client/publish.h>
@@ -55,6 +56,7 @@ PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
 #define MODULE_USAGE \
 	"( publish.sink=<bool, default true> ) " \
 	"( publish.source=<bool, default false> ) " \
+	"( publish.rules=<match-action rules> ) " \
 	"( publish.rate=<int, default 48000> ) " \
 	"( publish.channels=<int, default 2> ) " \
 	"( publish.format=<S16BE|S24BE|S32BE, default S16BE> ) " \
@@ -132,6 +134,7 @@ struct impl {
 
 	bool publish_sink;
 	bool publish_source;
+	char *publish_rules;          /* JSON match-rules, may be NULL */
 	uint32_t rate;
 	uint32_t channels;
 	char *format;
@@ -242,6 +245,31 @@ static struct service *find_service_by_id(struct impl *impl, uint32_t id)
 	return NULL;
 }
 
+/* match-rules callback: a rule matched, action is "publish" or "exclude".
+ * Stores the decision in match_info and stops further evaluation by
+ * leaving the loop on first match (callback is invoked per matching
+ * rule; we just record the latest, but the spec says "first match wins"
+ * — so we ignore subsequent matches by remembering matched=true). */
+struct match_info {
+	bool matched;
+	bool publish;
+};
+
+static int rule_matched_cb(void *data, const char *location SPA_UNUSED,
+			   const char *action,
+			   const char *str SPA_UNUSED, size_t len SPA_UNUSED)
+{
+	struct match_info *mi = data;
+	if (mi->matched)
+		return 0;  /* first match wins */
+	mi->matched = true;
+	if (spa_streq(action, "publish"))
+		mi->publish = true;
+	else if (spa_streq(action, "exclude"))
+		mi->publish = false;
+	return 0;
+}
+
 static bool should_publish(struct impl *impl, const struct spa_dict *props,
 			   bool *is_sink_out)
 {
@@ -278,6 +306,17 @@ static bool should_publish(struct impl *impl, const struct spa_dict *props,
 	 * a single-host test setup chains forever. */
 	if (strncmp(node_name, "network.", 8) == 0)
 		return false;
+
+	/* User-supplied match rules — first match wins. Default if no rule
+	 * matches (or rules absent): publish. */
+	if (impl->publish_rules) {
+		struct match_info mi = { .matched = false, .publish = true };
+		pw_conf_match_rules(impl->publish_rules,
+				    strlen(impl->publish_rules),
+				    NAME, props, rule_matched_cb, &mi);
+		if (mi.matched && !mi.publish)
+			return false;
+	}
 
 	*is_sink_out = is_sink;
 	return true;
@@ -905,6 +944,7 @@ static void impl_free(struct impl *impl)
 	free(impl->format);
 	free(impl->codec);
 	free(impl->multicast_ip);
+	free(impl->publish_rules);
 	pw_properties_free(impl->props);
 	free(impl);
 }
@@ -958,6 +998,8 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 
 	impl->publish_sink   = pw_properties_get_bool(props, "publish.sink",   true);
 	impl->publish_source = pw_properties_get_bool(props, "publish.source", false);
+	str = pw_properties_get(props, "publish.rules");
+	impl->publish_rules = str ? strdup(str) : NULL;
 	impl->rate     = pw_properties_get_uint32(props, "publish.rate",     PWNZ_DEFAULT_RATE);
 	impl->channels = pw_properties_get_uint32(props, "publish.channels", PWNZ_DEFAULT_CHANNELS);
 	str = pw_properties_get(props, "publish.format");
