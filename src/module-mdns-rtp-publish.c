@@ -641,7 +641,13 @@ static int load_local_endpoint(struct service *s)
 		fprintf(f, "sess.latency.msec = %u ", impl->latency_ms);
 		fprintf(f, "stream.props = { ");
 		fprintf(f, "node.network = true ");
-		fprintf(f, "stream.may-pause = true ");
+		/* NB: NOT setting stream.may-pause here.  Upstream rtp-source
+		 * with may-pause=true closes its UDP recv socket after the
+		 * cleanup timer fires when no packets arrive — once closed,
+		 * subsequent traffic from the (woken-up) sender gets dropped
+		 * by the kernel and nothing wakes the receiver back up.
+		 * Keeping the socket bound permanently is the right trade-off
+		 * (silent receive socket costs near-zero CPU). */
 		fprintf(f, "rtp.ptime = %s ", pbuf);
 		if (!impl->multicast)
 			fprintf(f, "igmp.check.interval.sec = 31536000 ");
