@@ -185,6 +185,50 @@ two stacked module loads.
 | `publish.ptime.msec` | `5` | RTP packet duration — see [Tuning](#tuning) |
 | `publish.latency.msec` | `200` | jitter buffer target on the receiver side; must be an integer multiple of `ptime` |
 
+### Per-card filtering
+
+If you want to publish only some local cards (or exclude a few), set
+`publish.rules` to a JSON match-action list using the same shape as
+upstream `module-rtp-sap`:
+
+```
+publish.rules = [
+  # Only publish USB DACs:
+  { matches = [ { node.name = "~^alsa_output\\.usb-.*" } ]
+    actions = { publish = { } } }
+
+  # ...and exclude HDMI outputs by description:
+  { matches = [ { node.description = "~.*HDMI.*" } ]
+    actions = { exclude = { } } }
+
+  # Default-deny everything else:
+  { matches = [ { node.name = "~.*" } ]
+    actions = { exclude = { } } }
+]
+```
+
+Semantics:
+
+- Each rule's `matches` is an array of property predicates. Within a
+  single predicate object, **all** key/value pairs must match the
+  node's properties. Between sibling predicates in the same `matches`
+  array, **any** matching predicate counts.
+- Prefix a value with `~` for a POSIX-extended regex; prefix `!` to
+  negate the equality check.
+- Actions are `publish = { }` (allow) or `exclude = { }` (skip).
+- **First matching rule wins.** Order matters.
+- Rules are evaluated **after** the built-in default excludes (monitor
+  sources, bluez5 devices, anything already wearing
+  `node.network = true`, and our own discover-side sinks named
+  `network.*`). You don't need to repeat those.
+- If `publish.rules` is unset, behaviour is the historical default:
+  publish every Audio/Sink (and Audio/Source, when
+  `publish.source = true`) that passes the built-in excludes.
+
+For ad-hoc temporary toggling without restarting pipewire, use the
+runtime metadata path described in
+[Runtime toggles via metadata](#runtime-toggles-via-metadata).
+
 ### discover (app-host)
 
 | Option | Default | Effect |
