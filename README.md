@@ -235,33 +235,10 @@ runtime metadata path described in
 |---|---|---|
 | `discover.sink` | `true` | consume remote sinks (create local virtual `Audio/Sink` for each) |
 | `discover.source` | `false` | consume remote sources (mic) too — **opt-in** |
-| `discover.source-on-demand` | `true` | publish the back-channel Avahi request (which makes the publish host open its mic and stream over the network) **only while a local app is actually recording** from the virtual mic node. Set `false` for legacy always-on-while-Input-profile behaviour. See note below. |
 | `discover.local` | `false` | when running two pipewire daemons on the same host for testing, allow services published locally |
 | `discover.protocol` | `"ipv4"` | which Avahi protocol family to browse. `ipv4` \| `ipv6` \| `any`. Default IPv4 matches the publish-side `0.0.0.0` bind; switch to `any`/`ipv6` only if peers are IPv6-only |
 | `discover.ptime.msec` | `5` | must match the publish side's value |
 | `discover.latency.msec` | `200` | jitter buffer target; must be a clean multiple of `ptime` |
-
-### Input on demand
-
-When `discover.source = true` and the user picks an `Input`-bearing
-profile for a peer card, by default this side **does not** start the
-back-channel right away. Instead it waits until a local application
-actually opens a record stream against the virtual mic node — only then
-is the unicast `_pipewire-rtp-req._udp` service published, which causes
-the publish host to open the ALSA mic and start streaming. When the last
-local recorder goes away the request is withdrawn after a ~1.5s debounce
-(swallows quick stop/start churn like a pavucontrol level test or an app
-reconnect), the publish host's rtp-sink unloads, and the remote ALSA mic
-closes. Mic-direction LAN traffic is exactly zero while no app is
-recording.
-
-Cost: a ~0.5–1s ramp-up on the very first packet after a record stream
-attaches (Avahi propagation + rtp-sink load on publish side + jitter
-buffer fill). Acceptable for Audacity / OBS / browsers / Discord;
-noticeable for hard real-time push-to-talk. Set
-`discover.source-on-demand = false` in a drop-in conf to restore the
-legacy behaviour (request stays up the whole time the Input profile is
-selected).
 
 ## Runtime toggles via metadata
 

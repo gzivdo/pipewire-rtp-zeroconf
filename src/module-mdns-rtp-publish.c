@@ -758,14 +758,6 @@ static int load_local_endpoint(struct service *s)
 		fprintf(f, "media.class = \"Stream/Output/Audio\" ");
 		fprintf(f, "node.target = \"%s\" ", s->node_name);
 		fprintf(f, "node.description = \"net-rx %s\" ", s->node_name);
-		/* Make the network playback stream visible in pavucontrol's
-		 * Playback tab: pavucontrol's default "Applications" filter
-		 * hides streams that have no application.* identity, so without
-		 * these the in-process rtp-source stream is invisible even
-		 * though it's actively writing samples to the local sink. */
-		fprintf(f, "application.name = \"pipewire-rtp-zeroconf (net-rx)\" ");
-		fprintf(f, "application.process.binary = \"pipewire-rtp-zeroconf\" ");
-		fprintf(f, "application.id = \"pipewire-rtp-zeroconf.net-rx\" ");
 		fprintf(f, "} }");
 	} else {
 		/* Sender path (mic): rtp-sink reading from local mic source,
@@ -1082,12 +1074,6 @@ static int load_rtp_sink_for_request(struct incoming_request *r,
 	fprintf(f, "node.target = \"%s\" ", s->node_name);
 	fprintf(f, "node.description = \"net-tx (req) %s\" ", s->node_name);
 	fprintf(f, "rtp.ptime = %s ", pbuf);
-	/* Same rationale as the receiver path: show up under pavucontrol's
-	 * Recording tab instead of being hidden by the default Applications
-	 * filter. */
-	fprintf(f, "application.name = \"pipewire-rtp-zeroconf (net-tx req)\" ");
-	fprintf(f, "application.process.binary = \"pipewire-rtp-zeroconf\" ");
-	fprintf(f, "application.id = \"pipewire-rtp-zeroconf.net-tx-req\" ");
 	fprintf(f, "} }");
 	fclose(f);
 
