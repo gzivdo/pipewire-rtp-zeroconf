@@ -1,3 +1,21 @@
+pipewire-net-zeroconf (0.1.4-1) unstable; urgency=medium
+
+  * discover: card_publish_request now embeds an FNV hash of
+    (peer_host, card_name) into the Avahi service name instead of
+    truncating card_name to 20 chars. Two cards on the same speaker host
+    whose card_name shares the first 20 chars (the common case —
+    alsa_card.pci-0000_XX_YY.Z is 26 chars and only the last 6 differ)
+    were collapsing to the same Avahi service name → Local name collision
+    → only the first card's back-channel was published → the second
+    card's mic never streamed (publish-host had no idea workpc was
+    waiting for it). Now both requests get distinct names + distinct
+    ports.
+  * peer-device: use designated-initializer form for spa_param_info[] to
+    silence -Wmissing-field-initializers warnings on the user/padding
+    fields.
+
+ -- pipewire-net-zeroconf <maintainer@example.invalid>  Sun, 17 May 2026 13:50:00 +0000
+
 pipewire-net-zeroconf (0.1.3-1) unstable; urgency=medium
 
   * peer-device: impl_add_listener now forces a full change_mask

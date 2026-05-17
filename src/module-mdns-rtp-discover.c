@@ -400,9 +400,16 @@ static int card_publish_request(struct peer_card *c)
 	if (c->req_port == 0)
 		c->req_port = impl->req_next_port++;
 
+	/* Avahi service names are limited to ~63 bytes, so we can't paste
+	 * the full card_name in. The old "%.20s: req %.20s:%.20s" truncation
+	 * collapsed cards like alsa_card.pci-0000_06_00.6 and ...03_00.0 to
+	 * the same prefix → Avahi returned Local name collision and the
+	 * second card's request was never published. Use an FNV hash of
+	 * (peer_host, card_name) to guarantee uniqueness while still
+	 * keeping a short readable prefix for avahi-browse. */
+	uint32_t h = fnv1a_32(c->peer_host, c->card_name);
 	snprintf(c->req_service_name, sizeof(c->req_service_name),
-		 "%.20s: req %.20s:%.20s", impl->host_name,
-		 c->peer_host, c->card_name);
+		 "%.16s: req %.10s %08x", impl->host_name, c->peer_host, h);
 
 	c->req_entry_group = avahi_entry_group_new(impl->avahi_client,
 						   req_entry_group_cb, c);

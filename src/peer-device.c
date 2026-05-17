@@ -357,10 +357,14 @@ struct peer_device *peer_device_new(struct pw_context *context,
 	 * reset user to 0. pw_impl_device watches for the flags change
 	 * (not the user value!) and uses that to invalidate its cache. */
 	dev->info = (struct spa_device_info) SPA_DEVICE_INFO_INIT();
-	dev->params[IDX_EnumProfile] = SPA_PARAM_INFO(SPA_PARAM_EnumProfile,
-						      SPA_PARAM_INFO_READ);
-	dev->params[IDX_Profile]     = SPA_PARAM_INFO(SPA_PARAM_Profile,
-						      SPA_PARAM_INFO_READWRITE);
+	dev->params[IDX_EnumProfile] = (struct spa_param_info){
+		.id    = SPA_PARAM_EnumProfile,
+		.flags = SPA_PARAM_INFO_READ,
+	};
+	dev->params[IDX_Profile] = (struct spa_param_info){
+		.id    = SPA_PARAM_Profile,
+		.flags = SPA_PARAM_INFO_READWRITE,
+	};
 	dev->info.params   = dev->params;
 	dev->info.n_params = N_INFO_PARAMS;
 

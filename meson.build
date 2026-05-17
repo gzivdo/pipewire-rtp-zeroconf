@@ -1,5 +1,5 @@
 project('pipewire-net-zeroconf', 'c',
-  version : '0.1.3',
+  version : '0.1.4',
   license : 'MIT',
   meson_version : '>= 0.59.0',
   default_options : [
