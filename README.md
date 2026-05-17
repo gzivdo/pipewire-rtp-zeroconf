@@ -612,6 +612,49 @@ to advertise sessions via SAP (RFC 2974). VLC sees them under "Playlist →
 Service Discovery → SAP announces"; ffmpeg/gstreamer pick them up the same
 way.
 
+## Limitations
+
+### Single producer per remote sink card
+
+For every published Audio/Sink, the publish host binds exactly one UDP
+port and loads one `libpipewire-module-rtp-source` on it. Upstream
+rtp-source uses one ringbuffer locked to one SSRC, so if two discover
+hosts both try to play to the same speaker card concurrently their
+packets either (a) get dropped as "unexpected SSRC" for one of them, or
+(b) with `sess.ignore-ssrc = true` get interleaved into the same
+ringbuffer at incompatible timestamps producing audible chaos. Neither
+is a useful "party speaker" mode.
+
+PulseAudio's `module-rtp-recv` *did* multi-producer via SAP: each sender
+announced its own multicast session, the receiver created a separate
+sink-input per session, and the local sink mixed them. We deliberately
+don't carry SAP over as the primary path (it's multicast-only,
+non-trivial to firewall, and the PA stack on top is the very thing we
+escaped from). One sender per sink covers homelab playback and is the
+common case; the multi-producer extension is queued as future work.
+
+#### Future-work options (sized so the next pass can just pick one)
+
+| # | Approach | Effort | Tradeoff |
+|---|---|---|---|
+| **A** | **Eager port pool + hash dispatch.** Publish allocates N ports per card up-front, advertises them in TXT, discover hashes `(local-hostname) mod N` to pick a slot. | ~80 lines | With N=4 and 3 producers a hash collision is ~75% likely → audio chaos for the unlucky pair. Doesn't scale. |
+| **Y / Z2** | **Dynamic per-requester Avahi play-request / play-response.** Discover publishes `_pipewire-rtp-play._udp` when it wants to play; publish allocates a fresh port + loads rtp-source on demand and publishes `_pipewire-rtp-play-resp._udp` with the port; discover sends there. Eager slot 0 + lazy slots 1..N-1. Adds inactivity timer for hard-disconnect cleanup. Add `rtp.receiver-ssrc` in the request to defend against SSRC contamination on fast bounce. | ~400 lines + 30 (timer) + 10 (SSRC) | Adds ~50–200 ms to first-packet ramp-up because of the extra mDNS round-trip. Graceful — every requester gets a private port. Mirrors the existing back-channel architecture. **The preferred option when we revisit.** |
+| **X** | **Custom SSRC demultiplexer on publish.** Publish keeps one UDP listener per card; on each incoming packet it dispatches to a per-`(src_ip, ssrc)` ringbuffer + PW stream that it creates lazily. No new Avahi services. | ~300–400 lines | Replaces upstream rtp-source with our own receiver — we re-implement the ringbuffer / jitter / dll / clock dance. Easy to introduce subtle audio glitches; debugging is much harder than the Avahi route. |
+| **Z1** | **Eager per-discoverer allocation.** Discover hosts publish `_pipewire-rtp-discoverer._udp` presence at startup; publish proactively allocates a slot for each `(local-card, discoverer)`. | ~250 lines | Wasteful — every discoverer-on-the-LAN reserves a port on every publish card, whether it ever plays or not. Untenable in busy LANs (10 idle laptops × 4 publish cards = 40 reserved ports). |
+
+Decision in v0.1.6: **none** — keep the single-producer model, accept it
+as a documented gap. Pick this up if/when a real "party speaker" use
+case comes in.
+
+### Multi-card publish hosts vs free routing in pavucontrol
+
+You can route the inbound network `net-rx ...` stream on a publish host
+to any local sink via pavucontrol (it's a virtual stream, see the note
+under "Installation"). The Avahi-published `node.target` is just the
+default — pavucontrol can override at runtime. So even without
+multi-producer, a single discover host can play to any of N speakers on
+the publish side by changing the routing.
+
 ## Status
 
 Working baseline, in production-style testing on Ubuntu 24.04 (PW 1.0.5) and
