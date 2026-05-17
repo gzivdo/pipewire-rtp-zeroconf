@@ -117,7 +117,7 @@ static struct spa_pod *build_profile(struct peer_device *this,
 				     uint32_t id, int profile_idx)
 {
 	const struct profile_def *p;
-	struct spa_pod_frame f;
+	struct spa_pod_frame f, fs, fc;
 
 	if (profile_idx < 0 || (size_t) profile_idx >= N_PROFILES) {
 		errno = EINVAL;
@@ -136,6 +136,36 @@ static struct spa_pod *build_profile(struct peer_device *this,
 				   ? SPA_PARAM_AVAILABILITY_yes
 				   : SPA_PARAM_AVAILABILITY_no),
 		0);
+
+	/* Emit classes Struct so WirePlumber's policy can see which
+	 * audio node-classes the profile activates. Shape matches what
+	 * alsa-acp-device emits: (n_classes, (class, n_nodes,
+	 * "card.profile.devices", Array(Int))*). */
+	uint32_t n_classes = 0;
+	if (p->needs & PEER_DIR_OUTPUT) n_classes++;
+	if (p->needs & PEER_DIR_INPUT)  n_classes++;
+
+	spa_pod_builder_prop(b, SPA_PARAM_PROFILE_classes, 0);
+	spa_pod_builder_push_struct(b, &fs);
+	spa_pod_builder_int(b, (int32_t) n_classes);
+	if (p->needs & PEER_DIR_OUTPUT) {
+		spa_pod_builder_push_struct(b, &fc);
+		spa_pod_builder_string(b, "Audio/Sink");
+		spa_pod_builder_int(b, 1);
+		spa_pod_builder_string(b, "card.profile.devices");
+		spa_pod_builder_array(b, sizeof(int32_t), SPA_TYPE_Int, 0, NULL);
+		spa_pod_builder_pop(b, &fc);
+	}
+	if (p->needs & PEER_DIR_INPUT) {
+		spa_pod_builder_push_struct(b, &fc);
+		spa_pod_builder_string(b, "Audio/Source");
+		spa_pod_builder_int(b, 1);
+		spa_pod_builder_string(b, "card.profile.devices");
+		spa_pod_builder_array(b, sizeof(int32_t), SPA_TYPE_Int, 0, NULL);
+		spa_pod_builder_pop(b, &fc);
+	}
+	spa_pod_builder_pop(b, &fs);
+
 	return spa_pod_builder_pop(b, &f);
 }
 
@@ -227,6 +257,8 @@ static int impl_set_param(void *object, uint32_t id, uint32_t flags,
 			SPA_TYPE_OBJECT_ParamProfile, NULL,
 			SPA_PARAM_PROFILE_index, SPA_POD_Int(&idx)) < 0)
 		return -EINVAL;
+	pw_log_info("peer_device '%s': set_param Profile index=%d (active was 0x%x)",
+		    this->node_name, idx, this->active_dirs);
 	if (idx < 0 || (size_t) idx >= N_PROFILES)
 		return -EINVAL;
 	if (!profile_is_offered(this, &PROFILES[idx]))
