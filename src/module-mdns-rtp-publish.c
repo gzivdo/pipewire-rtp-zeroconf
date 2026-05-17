@@ -183,7 +183,7 @@ struct impl {
 	uint16_t port_fixed_value;
 	uint16_t port_base;
 	uint16_t port_range;
-	uint16_t next_port_offset;
+	uint64_t port_used_bits[16];   /* bitmap, up to 1024 ports */
 
 	bool sap_enabled;
 	struct pw_impl_module *sap_mod;
@@ -283,19 +283,40 @@ static struct service *find_service_by_node_name(struct impl *impl, const char *
 
 static int allocate_port(struct impl *impl, uint16_t *out_port)
 {
+	uint16_t base = impl->multicast ? impl->multicast_port : impl->port_base;
 	if (impl->port_fixed) {
-		/* fixed-port mode: only the first card gets it */
-		if (impl->next_port_offset >= 1)
+		uint16_t bit = 0;
+		uint64_t mask = 1ULL << bit;
+		if (impl->port_used_bits[0] & mask)
 			return -EADDRINUSE;
+		impl->port_used_bits[0] |= mask;
 		*out_port = impl->port_fixed_value;
-		impl->next_port_offset = 1;
 		return 0;
 	}
-	if (impl->next_port_offset >= impl->port_range)
-		return -EADDRINUSE;
+	uint32_t cap = impl->port_range;
+	if (cap > (uint32_t)(sizeof(impl->port_used_bits) * 8))
+		cap = sizeof(impl->port_used_bits) * 8;
+	for (uint32_t i = 0; i < cap; i++) {
+		uint64_t *w = &impl->port_used_bits[i / 64];
+		uint64_t m = 1ULL << (i % 64);
+		if (!(*w & m)) {
+			*w |= m;
+			*out_port = base + (uint16_t) i;
+			return 0;
+		}
+	}
+	return -EADDRINUSE;
+}
+
+static void release_port(struct impl *impl, uint16_t port)
+{
 	uint16_t base = impl->multicast ? impl->multicast_port : impl->port_base;
-	*out_port = base + impl->next_port_offset++;
-	return 0;
+	uint16_t fixed_base = impl->port_fixed ? impl->port_fixed_value : base;
+	if (port < fixed_base) return;
+	uint32_t i = (impl->port_fixed) ? 0 : (uint32_t)(port - base);
+	if (i >= sizeof(impl->port_used_bits) * 8)
+		return;
+	impl->port_used_bits[i / 64] &= ~(1ULL << (i % 64));
 }
 
 /* -- helpers ----------------------------------------------------------- */
@@ -1013,8 +1034,10 @@ static void service_apply_state(struct service *s)
 
 static void service_free(struct service *s)
 {
+	struct impl *impl = s->impl;
 	spa_list_remove(&s->link);
 	unpublish_service(s);
+	release_port(impl, s->port);
 	free(s->node_name);
 	free(s->node_description);
 	free(s->card_name);
@@ -1422,7 +1445,8 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 					"publish.port.range", PWNZ_DEFAULT_PORT_RANGE);
 	if (impl->port_range == 0)
 		impl->port_range = 1;
-	impl->next_port_offset = 0;
+	if (impl->port_range > sizeof(impl->port_used_bits) * 8)
+		impl->port_range = sizeof(impl->port_used_bits) * 8;
 
 	impl->sap_enabled = pw_properties_get_bool(props, "publish.sap", false);
 
