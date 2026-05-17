@@ -1,0 +1,93 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Need write to create the release + upload assets
+permissions:
+  contents: write
+
+jobs:
+  build-deb:
+    name: build deb (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            devscripts debhelper dpkg-dev fakeroot \
+            meson ninja-build pkgconf \
+            libpipewire-0.3-dev libspa-0.2-dev libavahi-client-dev
+
+      - name: dpkg-buildpackage
+        run: dpkg-buildpackage -us -uc -b
+
+      - name: stage debs with os suffix
+        run: |
+          mkdir -p stage
+          # Tag debs with the runner OS so the released filenames don't
+          # collide (the source debs are named the same on both
+          # versions, but the binaries link against different
+          # libpipewire ABIs).
+          for f in ../pipewire-rtp-zeroconf*_*.deb; do
+            base=$(basename "$f" .deb)
+            cp "$f" "stage/${base}_${{ matrix.os }}.deb"
+          done
+          ls -la stage/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debs-${{ matrix.os }}
+          path: stage/*.deb
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: build-deb
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: debs-*
+          merge-multiple: true
+
+      - name: list collected debs
+        run: ls -la artifacts/
+
+      - name: extract changelog entry for tag
+        id: changelog
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          # Pull the matching block from debian/changelog (between the
+          # version header and the next blank-line "  -- " trailer).
+          awk -v ver="$tag" '
+            $0 ~ "^pipewire-rtp-zeroconf \\("ver"-" {flag=1; next}
+            flag && /^ -- / {flag=0}
+            flag {print}
+          ' debian/changelog > notes.md
+          if [ ! -s notes.md ]; then
+            echo "no debian/changelog entry for v$tag — release notes will be empty"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body_path: notes.md
+          files: artifacts/*.deb
+          generate_release_notes: false
+          draft: false
+          prerelease: false
