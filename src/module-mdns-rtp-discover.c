@@ -107,6 +107,13 @@ struct peer_card {
 	char *description;   /* user-facing label */
 
 	uint32_t available_dirs;   /* OR of PEER_DIR_* the card actually offers */
+	uint32_t loaded_dirs;      /* OR of PEER_DIR_* we've already attached
+				    * a tunnel for; used to dedup duplicate
+				    * service announcements (IPv4+IPv6, multi-
+				    * NIC, bridge etc) before any tunnel /
+				    * peer_device state is created — the
+				    * tunnel-list check fired too late since
+				    * the new tunnel is appended below. */
 
 	struct spa_list tunnels;   /* of struct tunnel via tunnel::link */
 	struct peer_device *device;
@@ -747,6 +754,23 @@ static void resolver_cb(AvahiServiceResolver *r,
 	const char *peer_card_name = kv.card_name ? kv.card_name : kv.node_name;
 	uint32_t new_dir = is_sink_mode ? PEER_DIR_OUTPUT : PEER_DIR_INPUT;
 
+	/* Dedup by (peer_host, card_name, direction): same service announced
+	 * on multiple local interfaces or both IPv4 and IPv6 hits
+	 * resolver_cb several times with different avahi service names but
+	 * identical TXT identity. We use card->loaded_dirs (set BEFORE any
+	 * tunnel/peer_device creation, so it's visible to the second event
+	 * even if the first hasn't finished load_local_endpoint yet). */
+	{
+		struct peer_card *dup_card = find_card(impl, peer_host,
+						       peer_card_name);
+		if (dup_card != NULL && (dup_card->loaded_dirs & new_dir)) {
+			pw_log_info("dup service '%s' for %s/%s dir=%s — ignoring",
+				    name, peer_host, peer_card_name,
+				    is_sink_mode ? "sink" : "source");
+			goto done;
+		}
+	}
+
 	/* Find or create the per-card aggregation. */
 	struct peer_card *card = find_card(impl, peer_host, peer_card_name);
 	bool card_is_new = (card == NULL);
@@ -803,8 +827,23 @@ static void resolver_cb(AvahiServiceResolver *r,
 			pw_log_warn("peer_device_new failed for card '%s/%s': %m",
 				    card->peer_host, card->card_name);
 	} else if (avail_changed && card->device) {
-		/* second direction service appeared — refresh profile list */
+		/* second direction service appeared — refresh profile list AND
+		 * re-apply the desired profile so a peer_card whose Input
+		 * arrived after its Output (or vice versa) grows active_dirs
+		 * to include the now-available second direction. Without
+		 * this, the initial default — computed when only one
+		 * direction was visible — stays in place forever. */
 		peer_device_set_available_dirs(card->device, card->available_dirs);
+
+		int saved = stored_profile(impl, card->peer_host, card->card_name);
+		uint32_t desired;
+		if (saved >= 0) {
+			desired = (uint32_t) saved & card->available_dirs;
+		} else {
+			desired = is_enabled(impl, card->peer_host, card->card_name)
+				  ? card_default_dirs(card) : 0;
+		}
+		peer_device_set_active_dirs(card->device, desired);
 	}
 
 	if (t == NULL) {
@@ -817,6 +856,7 @@ static void resolver_cb(AvahiServiceResolver *r,
 		spa_list_append(&card->tunnels, &t->link);
 	}
 	t->is_sink_mode = is_sink_mode;
+	card->loaded_dirs |= new_dir;
 	free(t->peer_node);
 	t->peer_node = strdup(kv.node_name);
 
@@ -906,6 +946,10 @@ static void browser_cb(AvahiServiceBrowser *b SPA_UNUSED,
 static void tunnel_free(struct tunnel *t)
 {
 	struct peer_card *card = t->card;
+	if (card != NULL) {
+		uint32_t bit = t->is_sink_mode ? PEER_DIR_OUTPUT : PEER_DIR_INPUT;
+		card->loaded_dirs &= ~bit;
+	}
 	spa_list_remove(&t->link);        /* off peer_card::tunnels */
 	spa_list_remove(&t->impl_link);   /* off impl::tunnels */
 	unload_local_endpoint(t);

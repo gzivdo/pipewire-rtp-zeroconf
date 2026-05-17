@@ -1,3 +1,31 @@
+pipewire-net-zeroconf (0.1.2-1) unstable; urgency=medium
+
+  * peer-device: persistent spa_device_info + spa_param_info[] in struct,
+    XOR-toggle SPA_PARAM_INFO_SERIAL flag on emit_info (mirrors
+    alsa-acp-device.c). Without this pw_impl_device never invalidated its
+    Profile param cache on PW 1.0.x, so pavucontrol/pulse-bridge saw a
+    stale Profile.current forever after the first read and the user's
+    choice "flipped back" each session.
+  * peer-device: sync device.profile property from both impl_set_param
+    and peer_device_set_available_dirs (was only set from the internal
+    set_active_dirs path), keeping property consistent with Profile.current
+    for WP find-best-profile and pulse-bridge card-active calculation.
+  * discover: dedup duplicate Avahi service announcements (IPv4 + IPv6
+    on the same interface produced two peer_devices for one card, every
+    set_param processed twice). Added peer_card.loaded_dirs bitmask set
+    before tunnel attachment so the second event for the same
+    (host, card, direction) is dropped early with a "dup service" info log.
+  * discover: when a card's second direction service arrives, re-apply
+    the stored profile / default after growing available_dirs — previously
+    active_dirs stayed at whatever single-direction default the card was
+    first created with.
+  * peer-device: emit SPA_PARAM_PROFILE_classes Struct alongside each
+    Profile (Audio/Sink/Source per direction) so WP policy understands
+    which node classes a profile activates.
+  * docs/2026-05-17-profile-cache-fix.md: full debug history.
+
+ -- pipewire-net-zeroconf <maintainer@example.invalid>  Sun, 17 May 2026 13:00:00 +0000
+
 pipewire-net-zeroconf (0.1.1-1) unstable; urgency=medium
 
   * Split into three binary packages:
@@ -23,8 +51,7 @@ pipewire-net-zeroconf (0.1.0-1) unstable; urgency=medium
     - libpipewire-module-mdns-rtp-publish: per-card Avahi entries with
       libpipewire-module-rtp-source as receiver.
     - libpipewire-module-mdns-rtp-discover: per-peer-card virtual sink/source
-      with stable node.name across hotplug.
-    - Defaults: publish sinks, do not publish sources; discover sinks,
-      do not discover sources. L16 BE 48000 Hz stereo. Unicast.
+      via libpipewire-module-rtp-sink/source, profile selection through
+      a SPA Device with Off/Output/Input/Output+Input profiles.
 
- -- pipewire-net-zeroconf <maintainer@example.invalid>  Sat, 16 May 2026 13:43:52 +0000
+ -- pipewire-net-zeroconf <maintainer@example.invalid>  Fri, 15 May 2026 12:00:00 +0000

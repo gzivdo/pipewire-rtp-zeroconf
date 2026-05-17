@@ -42,6 +42,21 @@ static const struct profile_def PROFILES[] = {
 };
 #define N_PROFILES (sizeof(PROFILES) / sizeof(PROFILES[0]))
 
+static const char *profile_name_for_dirs(uint32_t dirs)
+{
+	for (size_t i = 0; i < N_PROFILES; i++)
+		if (PROFILES[i].needs == dirs)
+			return PROFILES[i].name;
+	return "off";
+}
+
+struct peer_device;
+static void sync_device_profile_prop(struct peer_device *dev);
+
+#define IDX_EnumProfile  0
+#define IDX_Profile      1
+#define N_INFO_PARAMS    2
+
 struct peer_device {
 	struct spa_device device;
 	struct spa_hook_list hooks;
@@ -51,6 +66,15 @@ struct peer_device {
 	char *peer_host;
 	uint32_t available_dirs;
 	uint32_t active_dirs;
+
+	/* Persistent spa_device_info + spa_param_info array, mirroring
+	 * alsa-acp-device.c. On each emit_info we toggle the
+	 * SPA_PARAM_INFO_SERIAL bit (XOR) on every param whose .user was
+	 * bumped and then reset .user to 0 — this is the actual signal
+	 * pw_impl_device watches for to invalidate its param cache.
+	 * Plain monotonic .user++ is not enough on PW 1.0.x. */
+	struct spa_device_info info;
+	struct spa_param_info params[N_INFO_PARAMS];
 
 	peer_device_profile_cb cb;
 	void *cb_user_data;
@@ -85,8 +109,6 @@ static int find_profile_by_dirs(const struct peer_device *this, uint32_t dirs)
 static int emit_info(struct peer_device *this)
 {
 	struct spa_dict_item items[10];
-	struct spa_device_info dinfo = SPA_DEVICE_INFO_INIT();
-	struct spa_param_info params[2];
 	int n = 0;
 
 	items[n++] = SPA_DICT_ITEM_INIT(SPA_KEY_DEVICE_API,         "network-rtp");
@@ -96,19 +118,23 @@ static int emit_info(struct peer_device *this)
 	items[n++] = SPA_DICT_ITEM_INIT(SPA_KEY_MEDIA_CLASS,        "Audio/Device");
 	items[n++] = SPA_DICT_ITEM_INIT("pipewire-net-zeroconf.peer.host", this->peer_host);
 
-	dinfo.change_mask = SPA_DEVICE_CHANGE_MASK_PROPS |
-			    SPA_DEVICE_CHANGE_MASK_PARAMS;
-	dinfo.props = &SPA_DICT_INIT(items, n);
+	this->info.change_mask |= SPA_DEVICE_CHANGE_MASK_PROPS;
+	this->info.props = &SPA_DICT_INIT(items, n);
 
-	spa_zero(params);
-	params[0].id    = SPA_PARAM_EnumProfile;
-	params[0].flags = SPA_PARAM_INFO_READ;
-	params[1].id    = SPA_PARAM_Profile;
-	params[1].flags = SPA_PARAM_INFO_READWRITE;
-	dinfo.n_params = SPA_N_ELEMENTS(params);
-	dinfo.params = params;
+	/* Toggle SPA_PARAM_INFO_SERIAL on params whose user>0, then reset
+	 * user. This is what alsa-acp-device.c does (line 226-233) and is
+	 * the actual cache-invalidation signal pw_impl_device watches for. */
+	if (this->info.change_mask & SPA_DEVICE_CHANGE_MASK_PARAMS) {
+		for (size_t i = 0; i < N_INFO_PARAMS; i++) {
+			if (this->params[i].user > 0) {
+				this->params[i].flags ^= SPA_PARAM_INFO_SERIAL;
+				this->params[i].user = 0;
+			}
+		}
+	}
 
-	spa_device_emit_info(&this->hooks, &dinfo);
+	spa_device_emit_info(&this->hooks, &this->info);
+	this->info.change_mask = 0;
 	return 0;
 }
 
@@ -265,10 +291,18 @@ static int impl_set_param(void *object, uint32_t id, uint32_t flags,
 		return -EINVAL;
 
 	uint32_t new_dirs = PROFILES[idx].needs;
-	if (new_dirs == this->active_dirs)
+	if (new_dirs == this->active_dirs) {
+		/* Reaffirm device.profile property even on no-op so it
+		 * stays consistent with Profile.current — WP / pulse-bridge
+		 * read this property when computing PA card active profile. */
+		sync_device_profile_prop(this);
 		return 0;
+	}
 
 	this->active_dirs = new_dirs;
+	this->info.change_mask |= SPA_DEVICE_CHANGE_MASK_PARAMS;
+	this->params[IDX_Profile].user++;
+	sync_device_profile_prop(this);
 	emit_info(this);
 	if (this->cb)
 		this->cb(this->cb_user_data, new_dirs);
@@ -302,6 +336,24 @@ struct peer_device *peer_device_new(struct pw_context *context,
 	dev->cb               = cb;
 	dev->cb_user_data     = user_data;
 
+	/* Persistent device info + per-param user counters (see
+	 * alsa-acp-device.c). spa_device_info.params *must* point at a
+	 * stable buffer that lives as long as the device — pw_impl_device
+	 * keeps the pointer for change detection across emit_info calls.
+	 *
+	 * The cache-invalidation trick (line 226-233 of alsa-acp-device.c)
+	 * is to TOGGLE the SPA_PARAM_INFO_SERIAL flag bit (XOR) on every
+	 * emit_info where the param's user counter is non-zero, then
+	 * reset user to 0. pw_impl_device watches for the flags change
+	 * (not the user value!) and uses that to invalidate its cache. */
+	dev->info = (struct spa_device_info) SPA_DEVICE_INFO_INIT();
+	dev->params[IDX_EnumProfile] = SPA_PARAM_INFO(SPA_PARAM_EnumProfile,
+						      SPA_PARAM_INFO_READ);
+	dev->params[IDX_Profile]     = SPA_PARAM_INFO(SPA_PARAM_Profile,
+						      SPA_PARAM_INFO_READWRITE);
+	dev->info.params   = dev->params;
+	dev->info.n_params = N_INFO_PARAMS;
+
 	dev->device.iface = SPA_INTERFACE_INIT(
 		SPA_TYPE_INTERFACE_Device, SPA_VERSION_DEVICE,
 		&peer_device_methods, dev);
@@ -313,6 +365,7 @@ struct peer_device *peer_device_new(struct pw_context *context,
 		SPA_KEY_DEVICE_NICK,        dev->node_name,
 		SPA_KEY_DEVICE_DESCRIPTION, dev->node_description,
 		SPA_KEY_MEDIA_CLASS,        "Audio/Device",
+		"device.profile",           profile_name_for_dirs(dev->active_dirs),
 		"pipewire-net-zeroconf.peer.host", dev->peer_host,
 		NULL);
 	if (props == NULL)
@@ -360,15 +413,39 @@ uint32_t peer_device_get_id(struct peer_device *dev)
 	return g ? pw_global_get_id(g) : SPA_ID_INVALID;
 }
 
+/* Mirror active_dirs into the device.profile property so WirePlumber's
+ * find-best-profile hook (which checks device.properties["device.profile"]
+ * with absolute priority before falling back to "highest priority available")
+ * picks the user's choice instead of overwriting it with output+input on
+ * every params-changed / pavucontrol reopen. */
+static void sync_device_profile_prop(struct peer_device *dev)
+{
+	if (dev->impl_device == NULL)
+		return;
+	struct spa_dict_item items[] = {
+		SPA_DICT_ITEM_INIT("device.profile",
+				   profile_name_for_dirs(dev->active_dirs)),
+	};
+	struct spa_dict dict = SPA_DICT_INIT_ARRAY(items);
+	pw_impl_device_update_properties(dev->impl_device, &dict);
+}
+
 int peer_device_set_active_dirs(struct peer_device *dev, uint32_t active_dirs)
 {
 	if (dev == NULL)
 		return -EINVAL;
 	if (active_dirs & ~dev->available_dirs)
 		return -EINVAL;
-	if (active_dirs == dev->active_dirs)
+	if (active_dirs == dev->active_dirs) {
+		/* Even when unchanged, keep the property in sync — WP may
+		 * have stripped/ignored it before we registered impl_device. */
+		sync_device_profile_prop(dev);
 		return 0;
+	}
 	dev->active_dirs = active_dirs;
+	dev->info.change_mask |= SPA_DEVICE_CHANGE_MASK_PARAMS;
+	dev->params[IDX_Profile].user++;
+	sync_device_profile_prop(dev);
 	emit_info(dev);
 	if (dev->cb)
 		dev->cb(dev->cb_user_data, active_dirs);
@@ -391,6 +468,10 @@ int peer_device_set_available_dirs(struct peer_device *dev,
 	uint32_t clamped = dev->active_dirs & available_dirs;
 	bool dirs_changed = (clamped != dev->active_dirs);
 	dev->active_dirs = clamped;
+	dev->info.change_mask |= SPA_DEVICE_CHANGE_MASK_PARAMS;
+	dev->params[IDX_EnumProfile].user++;
+	dev->params[IDX_Profile].user++;
+	sync_device_profile_prop(dev);
 	emit_info(dev);
 	if (dirs_changed && dev->cb)
 		dev->cb(dev->cb_user_data, clamped);
