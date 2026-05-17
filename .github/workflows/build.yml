@@ -13,11 +13,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # ubuntu-24.04 ships PipeWire 1.0.x.
-        # TODO: add ubuntu-26.04 once GitHub Actions ships the runner —
-        # the SPA/PW API is ABI-stable to 1.6.x so the same source
-        # should build cleanly there, we just can't verify in CI yet.
-        os: [ubuntu-24.04]
+        # ubuntu-24.04 ships PipeWire 1.0.x; ubuntu-26.04 ships PipeWire 1.6.x.
+        # SPA/PW API is ABI-stable between them (SPA_VERSION_DEVICE=0,
+        # spa_device_info / spa_param_info identical) so the same source
+        # builds cleanly on both LTS runners.
+        os: [ubuntu-24.04, ubuntu-26.04]
     steps:
       - uses: actions/checkout@v4
 
