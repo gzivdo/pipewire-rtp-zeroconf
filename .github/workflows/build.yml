@@ -10,6 +10,9 @@ jobs:
   build:
     name: ${{ matrix.label }}
     runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -25,7 +28,7 @@ jobs:
             os_tag: ubuntu-26.04
     container: ${{ matrix.container }}
     steps:
-      - name: bootstrap container
+      - name: bootstrap container (root, no sudo yet)
         if: matrix.container != ''
         run: |
           apt-get update
@@ -36,26 +39,24 @@ jobs:
 
       - name: install build deps
         run: |
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             devscripts debhelper dpkg-dev fakeroot build-essential \
             meson ninja-build pkgconf \
             libpipewire-0.3-dev libspa-0.2-dev libavahi-client-dev
 
       - name: dpkg-buildpackage
-        # Builds .deb via debian/rules → meson → ninja. SPA headers
-        # emit -Wmissing-field-initializers / -Wunused-parameter that we
+        # debian/rules → meson → ninja. SPA headers emit warnings we
         # can't suppress, so warnings != failure.
         run: dpkg-buildpackage -us -uc -b
 
       - name: collect debs and sanity-check exports
         run: |
           mkdir -p artifacts
-          # ../*.deb on the host, but inside the container the working
-          # tree lives at /__w/<repo>/<repo> and parent is /__w/<repo>.
           mv ../pipewire-rtp-zeroconf*_*.deb artifacts/
           ls -la artifacts/
-          for deb in artifacts/pipewire-rtp-zeroconf-{publish,discover}_*.deb; do
+          for deb in artifacts/pipewire-rtp-zeroconf-publish_*.deb \
+                     artifacts/pipewire-rtp-zeroconf-discover_*.deb; do
             dpkg-deb -x "$deb" extract
           done
           for so in extract/usr/lib/*/pipewire-0.3/libpipewire-module-mdns-rtp-*.so; do
