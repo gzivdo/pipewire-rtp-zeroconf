@@ -7,15 +7,17 @@ on:
     branches: [main]
 
 jobs:
-  meson-build:
-    name: meson build (${{ matrix.os }})
+  build:
+    name: build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        # ubuntu-24.04 ships PipeWire 1.0.x; ubuntu-26.04 ships PipeWire 1.6.x.
-        # Build on both to catch any SPA/PW API drift between LTS versions.
-        os: [ubuntu-24.04, ubuntu-26.04]
+        # ubuntu-24.04 ships PipeWire 1.0.x.
+        # TODO: add ubuntu-26.04 once GitHub Actions ships the runner —
+        # the SPA/PW API is ABI-stable to 1.6.x so the same source
+        # should build cleanly there, we just can't verify in CI yet.
+        os: [ubuntu-24.04]
     steps:
       - uses: actions/checkout@v4
 
@@ -23,56 +25,30 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            meson ninja-build pkgconf \
-            libpipewire-0.3-dev libspa-0.2-dev libavahi-client-dev \
-            build-essential
-
-      - name: meson setup
-        run: meson setup build --warnlevel=2
-
-      - name: ninja build
-        run: ninja -C build -v 2>&1 | tee build.log
-        # SPA headers themselves emit -Wmissing-field-initializers /
-        # -Wunused-parameter that we can't suppress without losing useful
-        # warnings in our own code, so warnings != failure. We still
-        # surface them in the log.
-
-      - name: sanity check shared objects
-        run: |
-          for so in build/src/libpipewire-module-mdns-rtp-publish.so \
-                    build/src/libpipewire-module-mdns-rtp-discover.so; do
-            test -f "$so" || { echo "missing $so"; exit 1; }
-            file "$so"
-            nm -D "$so" | grep -q pipewire__module_init || \
-              { echo "$so: no pipewire__module_init export"; exit 1; }
-          done
-
-  deb-build:
-    name: deb build (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, ubuntu-26.04]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: install build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            devscripts debhelper dpkg-dev fakeroot \
+            devscripts debhelper dpkg-dev fakeroot build-essential \
             meson ninja-build pkgconf \
             libpipewire-0.3-dev libspa-0.2-dev libavahi-client-dev
 
       - name: dpkg-buildpackage
+        # Builds .deb via debian/rules → meson → ninja. SPA headers
+        # emit -Wmissing-field-initializers / -Wunused-parameter that we
+        # can't suppress, so warnings != failure.
         run: dpkg-buildpackage -us -uc -b
 
-      - name: collect debs
+      - name: collect debs and sanity-check exports
         run: |
           mkdir -p artifacts
-          mv ../pipewire-rtp-zeroconf*_*.deb artifacts/ 2>/dev/null || true
+          mv ../pipewire-rtp-zeroconf*_*.deb artifacts/
           ls -la artifacts/
+          # Verify the published .so actually loads as a PW module.
+          for deb in artifacts/pipewire-rtp-zeroconf-{publish,discover}_*.deb; do
+            dpkg-deb -x "$deb" extract
+          done
+          for so in extract/usr/lib/*/pipewire-0.3/libpipewire-module-mdns-rtp-*.so; do
+            file "$so"
+            nm -D "$so" | grep -q pipewire__module_init || \
+              { echo "$so: missing pipewire__module_init export"; exit 1; }
+          done
 
       - uses: actions/upload-artifact@v4
         with:
