@@ -5,25 +5,38 @@ on:
     tags:
       - 'v*'
 
-# Need write to create the release + upload assets
 permissions:
   contents: write
 
 jobs:
   build-deb:
-    name: build deb (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.label }}
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-26.04]
+        include:
+          - label: build (ubuntu-24.04)
+            container: ''
+            os_tag: ubuntu-24.04
+          - label: build (ubuntu-26.04 via container)
+            container: ubuntu:26.04
+            os_tag: ubuntu-26.04
+    container: ${{ matrix.container }}
     steps:
+      - name: bootstrap container
+        if: matrix.container != ''
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl gnupg git sudo
+
       - uses: actions/checkout@v4
 
       - name: install build deps
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             devscripts debhelper dpkg-dev fakeroot build-essential \
             meson ninja-build pkgconf \
             libpipewire-0.3-dev libspa-0.2-dev libavahi-client-dev
@@ -34,19 +47,18 @@ jobs:
       - name: stage debs with os suffix
         run: |
           mkdir -p stage
-          # Tag debs with the runner OS so the released filenames don't
-          # collide (the source debs are named the same on both
-          # versions, but the binaries link against different
-          # libpipewire ABIs).
+          # The source debs have identical filenames across the two
+          # ubuntu versions, but the binaries link against different
+          # libpipewire ABIs. Suffix so released assets don't collide.
           for f in ../pipewire-rtp-zeroconf*_*.deb; do
             base=$(basename "$f" .deb)
-            cp "$f" "stage/${base}_${{ matrix.os }}.deb"
+            cp "$f" "stage/${base}_${{ matrix.os_tag }}.deb"
           done
           ls -la stage/
 
       - uses: actions/upload-artifact@v4
         with:
-          name: debs-${{ matrix.os }}
+          name: debs-${{ matrix.os_tag }}
           path: stage/*.deb
           if-no-files-found: error
 
@@ -70,8 +82,6 @@ jobs:
         id: changelog
         run: |
           tag="${GITHUB_REF#refs/tags/v}"
-          # Pull the matching block from debian/changelog (between the
-          # version header and the next blank-line "  -- " trailer).
           awk -v ver="$tag" '
             $0 ~ "^pipewire-rtp-zeroconf \\("ver"-" {flag=1; next}
             flag && /^ -- / {flag=0}
@@ -80,7 +90,6 @@ jobs:
           if [ ! -s notes.md ]; then
             echo "no debian/changelog entry for v$tag — release notes will be empty"
           fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - uses: softprops/action-gh-release@v2
         with:

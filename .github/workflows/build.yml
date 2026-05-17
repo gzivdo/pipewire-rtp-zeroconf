@@ -8,23 +8,36 @@ on:
 
 jobs:
   build:
-    name: build (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.label }}
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        # ubuntu-24.04 ships PipeWire 1.0.x; ubuntu-26.04 ships PipeWire 1.6.x.
-        # SPA/PW API is ABI-stable between them (SPA_VERSION_DEVICE=0,
-        # spa_device_info / spa_param_info identical) so the same source
-        # builds cleanly on both LTS runners.
-        os: [ubuntu-24.04, ubuntu-26.04]
+        include:
+          # Native 24.04 — fast path, PipeWire 1.0.x.
+          - label: build (ubuntu-24.04)
+            container: ''
+            os_tag: ubuntu-24.04
+          # 26.04 via container so we don't depend on GitHub shipping a
+          # native runner. ubuntu:26.04 (resolute) has PipeWire 1.6.x.
+          - label: build (ubuntu-26.04 via container)
+            container: ubuntu:26.04
+            os_tag: ubuntu-26.04
+    container: ${{ matrix.container }}
     steps:
+      - name: bootstrap container
+        if: matrix.container != ''
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl gnupg git sudo
+
       - uses: actions/checkout@v4
 
       - name: install build deps
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             devscripts debhelper dpkg-dev fakeroot build-essential \
             meson ninja-build pkgconf \
             libpipewire-0.3-dev libspa-0.2-dev libavahi-client-dev
@@ -38,9 +51,10 @@ jobs:
       - name: collect debs and sanity-check exports
         run: |
           mkdir -p artifacts
+          # ../*.deb on the host, but inside the container the working
+          # tree lives at /__w/<repo>/<repo> and parent is /__w/<repo>.
           mv ../pipewire-rtp-zeroconf*_*.deb artifacts/
           ls -la artifacts/
-          # Verify the published .so actually loads as a PW module.
           for deb in artifacts/pipewire-rtp-zeroconf-{publish,discover}_*.deb; do
             dpkg-deb -x "$deb" extract
           done
@@ -52,6 +66,6 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: debs-${{ matrix.os }}
+          name: debs-${{ matrix.os_tag }}
           path: artifacts/*.deb
           if-no-files-found: error
