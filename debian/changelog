@@ -1,4 +1,26 @@
-pipewire-net-zeroconf (0.1.4-1) unstable; urgency=medium
+pipewire-rtp-zeroconf (0.1.5-1) unstable; urgency=medium
+
+  * Rename project, source package, binary packages and drop-in confs
+    from pipewire-net-zeroconf* to pipewire-rtp-zeroconf*. New name
+    matches the GitHub repo and is more descriptive (RTP/mDNS transport,
+    not "any network").
+    Drop-in confs renamed:
+      30-net-zeroconf-publish.conf  → 30-rtp-zeroconf-publish.conf
+      31-net-zeroconf-discover.conf → 31-rtp-zeroconf-discover.conf
+    Metadata key prefix changed from "pipewire-net-zeroconf.*" to
+    "pipewire-rtp-zeroconf.*" — stored per-card profile choices and
+    enable/disable toggles from older installs will NOT carry over;
+    re-pick once after upgrading.
+    Binary package names changed:
+      pipewire-net-zeroconf{-publish,-discover}  →
+      pipewire-rtp-zeroconf{-publish,-discover}
+    Old packages are not transitionally replaced; uninstall the
+    pipewire-net-zeroconf* packages by hand before installing the new
+    ones to avoid both sides loading at once.
+
+ -- pipewire-rtp-zeroconf <maintainer@example.invalid>  Sun, 17 May 2026 14:00:00 +0000
+
+pipewire-rtp-zeroconf (0.1.4-1) unstable; urgency=medium
 
   * discover: card_publish_request now embeds an FNV hash of
     (peer_host, card_name) into the Avahi service name instead of
@@ -14,9 +36,9 @@ pipewire-net-zeroconf (0.1.4-1) unstable; urgency=medium
     silence -Wmissing-field-initializers warnings on the user/padding
     fields.
 
- -- pipewire-net-zeroconf <maintainer@example.invalid>  Sun, 17 May 2026 13:50:00 +0000
+ -- pipewire-rtp-zeroconf <maintainer@example.invalid>  Sun, 17 May 2026 13:50:00 +0000
 
-pipewire-net-zeroconf (0.1.3-1) unstable; urgency=medium
+pipewire-rtp-zeroconf (0.1.3-1) unstable; urgency=medium
 
   * peer-device: impl_add_listener now forces a full change_mask
     (PROPS|PARAMS) before the first emit_info, mirroring
@@ -31,9 +53,9 @@ pipewire-net-zeroconf (0.1.3-1) unstable; urgency=medium
     peer_device, but the new device's first listener wasn't getting
     PARAMS bit so its profile list never showed up).
 
- -- pipewire-net-zeroconf <maintainer@example.invalid>  Sun, 17 May 2026 13:40:00 +0000
+ -- pipewire-rtp-zeroconf <maintainer@example.invalid>  Sun, 17 May 2026 13:40:00 +0000
 
-pipewire-net-zeroconf (0.1.2-1) unstable; urgency=medium
+pipewire-rtp-zeroconf (0.1.2-1) unstable; urgency=medium
 
   * peer-device: persistent spa_device_info + spa_param_info[] in struct,
     XOR-toggle SPA_PARAM_INFO_SERIAL flag on emit_info (mirrors
@@ -59,28 +81,28 @@ pipewire-net-zeroconf (0.1.2-1) unstable; urgency=medium
     which node classes a profile activates.
   * docs/2026-05-17-profile-cache-fix.md: full debug history.
 
- -- pipewire-net-zeroconf <maintainer@example.invalid>  Sun, 17 May 2026 13:00:00 +0000
+ -- pipewire-rtp-zeroconf <maintainer@example.invalid>  Sun, 17 May 2026 13:00:00 +0000
 
-pipewire-net-zeroconf (0.1.1-1) unstable; urgency=medium
+pipewire-rtp-zeroconf (0.1.1-1) unstable; urgency=medium
 
   * Split into three binary packages:
-      - pipewire-net-zeroconf-publish   (speaker-host)
-      - pipewire-net-zeroconf-discover  (app-host)
-      - pipewire-net-zeroconf           (metapackage)
+      - pipewire-rtp-zeroconf-publish   (speaker-host)
+      - pipewire-rtp-zeroconf-discover  (app-host)
+      - pipewire-rtp-zeroconf           (metapackage)
     Most hosts only need one of the two; the previous single-package
     layout caused both sides to load by default which led to spurious
     rtp-sink connect errors on speaker-only hosts.
   * Drop-in confs renamed and now ship one per module:
-      30-net-zeroconf-publish.conf, 31-net-zeroconf-discover.conf.
+      30-rtp-zeroconf-publish.conf, 31-rtp-zeroconf-discover.conf.
   * Suppress upstream rtp-source's bogus IGMP-recovery noise in unicast
     bindings via igmp.check.interval.sec = 31536000.
   * Avahi name collision: retry add_service up to 16 times with
     avahi_alternative_service_name() to handle multiple cards sharing a
     description.
 
- -- pipewire-net-zeroconf <maintainer@example.invalid>  Sat, 16 May 2026 19:00:00 +0000
+ -- pipewire-rtp-zeroconf <maintainer@example.invalid>  Sat, 16 May 2026 19:00:00 +0000
 
-pipewire-net-zeroconf (0.1.0-1) unstable; urgency=medium
+pipewire-rtp-zeroconf (0.1.0-1) unstable; urgency=medium
 
   * Initial release.
     - libpipewire-module-mdns-rtp-publish: per-card Avahi entries with
@@ -89,4 +111,4 @@ pipewire-net-zeroconf (0.1.0-1) unstable; urgency=medium
       via libpipewire-module-rtp-sink/source, profile selection through
       a SPA Device with Off/Output/Input/Output+Input profiles.
 
- -- pipewire-net-zeroconf <maintainer@example.invalid>  Fri, 15 May 2026 12:00:00 +0000
+ -- pipewire-rtp-zeroconf <maintainer@example.invalid>  Fri, 15 May 2026 12:00:00 +0000

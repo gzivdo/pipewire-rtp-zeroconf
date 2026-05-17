@@ -1,5 +1,5 @@
-project('pipewire-net-zeroconf', 'c',
-  version : '0.1.4',
+project('pipewire-rtp-zeroconf', 'c',
+  version : '0.1.5',
   license : 'MIT',
   meson_version : '>= 0.59.0',
   default_options : [

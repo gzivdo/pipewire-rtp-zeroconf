@@ -1,7 +1,7 @@
-Source: pipewire-net-zeroconf
+Source: pipewire-rtp-zeroconf
 Section: sound
 Priority: optional
-Maintainer: pipewire-net-zeroconf <maintainer@example.invalid>
+Maintainer: pipewire-rtp-zeroconf <maintainer@example.invalid>
 Build-Depends: debhelper-compat (= 13),
                meson (>= 0.59),
                ninja-build,
@@ -12,7 +12,7 @@ Build-Depends: debhelper-compat (= 13),
 Standards-Version: 4.6.2
 Rules-Requires-Root: no
 
-Package: pipewire-net-zeroconf-publish
+Package: pipewire-rtp-zeroconf-publish
 Architecture: linux-any
 Depends: ${shlibs:Depends},
          ${misc:Depends},
@@ -21,15 +21,15 @@ Depends: ${shlibs:Depends},
 Description: PipeWire mDNS/RTP audio sharing — publish (speaker-host) side
  Native PipeWire module that exposes local audio sinks (and optionally
  sources) on the LAN via Avahi/mDNS under the _pipewire-rtp._udp service
- type. Remote machines running pipewire-net-zeroconf-discover will see
+ type. Remote machines running pipewire-rtp-zeroconf-discover will see
  each local card as a virtual sink they can play into.
  .
- Loaded by /usr/share/pipewire/pipewire.conf.d/30-net-zeroconf-publish.conf.
+ Loaded by /usr/share/pipewire/pipewire.conf.d/30-rtp-zeroconf-publish.conf.
  .
  Install this package on machines that own audio hardware (speakers,
  amplifier inputs, USB DACs).
 
-Package: pipewire-net-zeroconf-discover
+Package: pipewire-rtp-zeroconf-discover
 Architecture: linux-any
 Depends: ${shlibs:Depends},
          ${misc:Depends},
@@ -41,17 +41,17 @@ Description: PipeWire mDNS/RTP audio sharing — discover (app-host) side
  (or Audio/Source) per remote card, with stable node names so per-app
  routing survives reconnect.
  .
- Loaded by /usr/share/pipewire/pipewire.conf.d/31-net-zeroconf-discover.conf.
+ Loaded by /usr/share/pipewire/pipewire.conf.d/31-rtp-zeroconf-discover.conf.
  .
  Install this package on machines that run applications producing audio
  (web browsers, music players) which should be playable on remote
  speakers.
 
-Package: pipewire-net-zeroconf
+Package: pipewire-rtp-zeroconf
 Architecture: all
-Depends: pipewire-net-zeroconf-publish (= ${binary:Version}),
-         pipewire-net-zeroconf-discover (= ${binary:Version})
+Depends: pipewire-rtp-zeroconf-publish (= ${binary:Version}),
+         pipewire-rtp-zeroconf-discover (= ${binary:Version})
 Description: PipeWire mDNS/RTP audio sharing — both sides (metapackage)
- Convenience metapackage that installs both pipewire-net-zeroconf-publish
- and pipewire-net-zeroconf-discover. Use when a single host should both
+ Convenience metapackage that installs both pipewire-rtp-zeroconf-publish
+ and pipewire-rtp-zeroconf-discover. Use when a single host should both
  share its own audio and consume LAN peers' audio.

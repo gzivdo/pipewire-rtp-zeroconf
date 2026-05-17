@@ -116,7 +116,7 @@ static int emit_info(struct peer_device *this)
 	items[n++] = SPA_DICT_ITEM_INIT(SPA_KEY_DEVICE_NAME,        this->node_name);
 	items[n++] = SPA_DICT_ITEM_INIT(SPA_KEY_DEVICE_DESCRIPTION, this->node_description);
 	items[n++] = SPA_DICT_ITEM_INIT(SPA_KEY_MEDIA_CLASS,        "Audio/Device");
-	items[n++] = SPA_DICT_ITEM_INIT("pipewire-net-zeroconf.peer.host", this->peer_host);
+	items[n++] = SPA_DICT_ITEM_INIT("pipewire-rtp-zeroconf.peer.host", this->peer_host);
 
 	this->info.change_mask |= SPA_DEVICE_CHANGE_MASK_PROPS;
 	this->info.props = &SPA_DICT_INIT(items, n);
@@ -380,7 +380,7 @@ struct peer_device *peer_device_new(struct pw_context *context,
 		SPA_KEY_DEVICE_DESCRIPTION, dev->node_description,
 		SPA_KEY_MEDIA_CLASS,        "Audio/Device",
 		"device.profile",           profile_name_for_dirs(dev->active_dirs),
-		"pipewire-net-zeroconf.peer.host", dev->peer_host,
+		"pipewire-rtp-zeroconf.peer.host", dev->peer_host,
 		NULL);
 	if (props == NULL)
 		goto err;

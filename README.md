@@ -1,4 +1,4 @@
-# pipewire-net-zeroconf
+# pipewire-rtp-zeroconf
 
 Native PipeWire modules that share LAN audio over RTP, with mDNS (Avahi)
 auto-discovery — a replacement for the legacy `module-zeroconf-discover` /
@@ -20,21 +20,21 @@ Three Debian binaries are produced from a single source tree:
 
 | Package | Install on | Why |
 |---|---|---|
-| `pipewire-net-zeroconf-publish` | machines that **own audio hardware** (speakers, amplifier inputs, USB DACs, HDMI audio outputs) | publishes each local card to the LAN as an RTP receiver |
-| `pipewire-net-zeroconf-discover` | machines that **run apps producing audio** (browser, music player, video conferencing) | makes each remote card appear locally as a virtual sink that apps can play to |
-| `pipewire-net-zeroconf` | metapackage; install when **the same host plays both roles** | depends on both above |
+| `pipewire-rtp-zeroconf-publish` | machines that **own audio hardware** (speakers, amplifier inputs, USB DACs, HDMI audio outputs) | publishes each local card to the LAN as an RTP receiver |
+| `pipewire-rtp-zeroconf-discover` | machines that **run apps producing audio** (browser, music player, video conferencing) | makes each remote card appear locally as a virtual sink that apps can play to |
+| `pipewire-rtp-zeroconf` | metapackage; install when **the same host plays both roles** | depends on both above |
 
 A typical setup:
 
 ```bash
 # living-room PC connected to the actual speakers:
-sudo dpkg -i pipewire-net-zeroconf-publish_*.deb
+sudo dpkg -i pipewire-rtp-zeroconf-publish_*.deb
 
 # laptop with the apps:
-sudo dpkg -i pipewire-net-zeroconf-discover_*.deb
+sudo dpkg -i pipewire-rtp-zeroconf-discover_*.deb
 
 # desktop with speakers AND apps that should also reach other hosts:
-sudo dpkg -i pipewire-net-zeroconf_*.deb         # pulls both
+sudo dpkg -i pipewire-rtp-zeroconf_*.deb         # pulls both
 ```
 
 After install on either side:
@@ -156,7 +156,7 @@ free up the CPU/network cost of the libpulse tunnels.
 ## Options reference
 
 Override either by editing the system file
-(`/usr/share/pipewire/pipewire.conf.d/30-net-zeroconf-publish.conf` or
+(`/usr/share/pipewire/pipewire.conf.d/30-rtp-zeroconf-publish.conf` or
 `-discover.conf`) or — preferred — by copying it to
 `~/.config/pipewire/pipewire.conf.d/` and editing there. A user-side file
 **replaces** the system one with the same name; you do **not** end up with
@@ -252,16 +252,16 @@ restarting pipewire**.
 ```bash
 # stop publishing one specific local sink (its Avahi entry is withdrawn
 # and the rtp-source child module is unloaded immediately):
-pw-metadata 0 "pipewire-net-zeroconf.publish.alsa_output.pci-0000_00_1f.3.analog-stereo.enabled" "false"
+pw-metadata 0 "pipewire-rtp-zeroconf.publish.alsa_output.pci-0000_00_1f.3.analog-stereo.enabled" "false"
 
 # re-enable:
-pw-metadata 0 "pipewire-net-zeroconf.publish.alsa_output.pci-0000_00_1f.3.analog-stereo.enabled" "true"
+pw-metadata 0 "pipewire-rtp-zeroconf.publish.alsa_output.pci-0000_00_1f.3.analog-stereo.enabled" "true"
 
 # clear the explicit value — falls back to default (= enabled):
-pw-metadata -d 0 "pipewire-net-zeroconf.publish.alsa_output.pci-0000_00_1f.3.analog-stereo.enabled"
+pw-metadata -d 0 "pipewire-rtp-zeroconf.publish.alsa_output.pci-0000_00_1f.3.analog-stereo.enabled"
 ```
 
-The key is `pipewire-net-zeroconf.publish.<node.name>.enabled`. Look up the
+The key is `pipewire-rtp-zeroconf.publish.<node.name>.enabled`. Look up the
 local `node.name` with `wpctl status` or `pactl list short sinks`.
 
 ### Disable / enable a discovered remote card on the discover side
@@ -270,10 +270,10 @@ local `node.name` with `wpctl status` or `pactl list short sinks`.
 # stop creating local virtual nodes for a specific peer card
 # (every direction belonging to this card is unloaded — output and
 # input together, since the card is the unit of toggle):
-pw-metadata 0 "pipewire-net-zeroconf.discover.<peer-host>.<peer-card-name>.enabled" "false"
+pw-metadata 0 "pipewire-rtp-zeroconf.discover.<peer-host>.<peer-card-name>.enabled" "false"
 
 # re-enable:
-pw-metadata 0 "pipewire-net-zeroconf.discover.<peer-host>.<peer-card-name>.enabled" "true"
+pw-metadata 0 "pipewire-rtp-zeroconf.discover.<peer-host>.<peer-card-name>.enabled" "true"
 ```
 
 The key parts come from the TXT records of the published service:
@@ -286,7 +286,7 @@ for virtual loopback sinks). Read both from
 ### Listing current toggle state
 
 ```bash
-pw-metadata 0 | grep pipewire-net-zeroconf
+pw-metadata 0 | grep pipewire-rtp-zeroconf
 ```
 
 ### Persistence
@@ -529,7 +529,7 @@ defaults. If you do, the .so is stale; reinstall.
 
 ### publish (speaker-host)
 
-`/usr/share/pipewire/pipewire.conf.d/30-net-zeroconf-publish.conf`:
+`/usr/share/pipewire/pipewire.conf.d/30-rtp-zeroconf-publish.conf`:
 
 ```
 context.modules = [
@@ -559,7 +559,7 @@ context.modules = [
 
 ### discover (app-host)
 
-`/usr/share/pipewire/pipewire.conf.d/31-net-zeroconf-discover.conf`:
+`/usr/share/pipewire/pipewire.conf.d/31-rtp-zeroconf-discover.conf`:
 
 ```
 context.modules = [

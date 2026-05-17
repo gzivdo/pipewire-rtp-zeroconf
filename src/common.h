@@ -4,7 +4,7 @@
 
 #include <stdint.h>
 
-/* Avahi service type for pipewire-net-zeroconf RTP audio announcements. */
+/* Avahi service type for pipewire-rtp-zeroconf RTP audio announcements. */
 #define PWNZ_SERVICE_TYPE "_pipewire-rtp._udp"
 
 /* Avahi service type for unicast back-channel requests. A discover host

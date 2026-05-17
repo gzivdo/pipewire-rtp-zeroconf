@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT
  *
- * pipewire-net-zeroconf — mDNS/RTP publish module.
+ * pipewire-rtp-zeroconf — mDNS/RTP publish module.
  *
  * Watches local PipeWire nodes and, for each Audio/Sink (and optionally
  * Audio/Source), allocates a UDP port, loads libpipewire-module-rtp-source
@@ -40,13 +40,13 @@
 #include "common.h"
 
 /* Metadata key prefix for runtime per-card toggles.
- *   pipewire-net-zeroconf.publish.<node-name>.enabled = "true" | "false"
+ *   pipewire-rtp-zeroconf.publish.<node-name>.enabled = "true" | "false"
  * Subject = 0 (PW_ID_CORE). Default (key absent) = enabled.
  * Set / clear via standard tooling, e.g.:
- *   pw-metadata 0 "pipewire-net-zeroconf.publish.alsa_output.pci-0000_00_1f.3.analog-stereo.enabled" "false"
- *   pw-metadata -d 0 "pipewire-net-zeroconf.publish.alsa_output.pci-0000_00_1f.3.analog-stereo.enabled"
+ *   pw-metadata 0 "pipewire-rtp-zeroconf.publish.alsa_output.pci-0000_00_1f.3.analog-stereo.enabled" "false"
+ *   pw-metadata -d 0 "pipewire-rtp-zeroconf.publish.alsa_output.pci-0000_00_1f.3.analog-stereo.enabled"
  */
-#define PWNZ_META_PREFIX  "pipewire-net-zeroconf.publish."
+#define PWNZ_META_PREFIX  "pipewire-rtp-zeroconf.publish."
 #define PWNZ_META_SUFFIX  ".enabled"
 
 #define NAME "mdns-rtp-publish"
@@ -74,7 +74,7 @@ PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
 	"( publish.sap=<bool, default false> ) "
 
 static const struct spa_dict_item module_props[] = {
-	{ PW_KEY_MODULE_AUTHOR, "pipewire-net-zeroconf" },
+	{ PW_KEY_MODULE_AUTHOR, "pipewire-rtp-zeroconf" },
 	{ PW_KEY_MODULE_DESCRIPTION, "Publish local audio nodes over mDNS+RTP" },
 	{ PW_KEY_MODULE_USAGE, MODULE_USAGE },
 	{ PW_KEY_MODULE_VERSION, PACKAGE_VERSION },

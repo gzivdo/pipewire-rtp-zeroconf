@@ -1,8 +1,8 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
-Upstream-Name: pipewire-net-zeroconf
+Upstream-Name: pipewire-rtp-zeroconf
 
 Files: *
-Copyright: 2026 pipewire-net-zeroconf contributors
+Copyright: 2026 pipewire-rtp-zeroconf contributors
 License: MIT
 
 Files: src/avahi-poll.*

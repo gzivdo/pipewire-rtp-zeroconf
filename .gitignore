@@ -9,9 +9,9 @@ debian/.debhelper/
 debian/files
 debian/*.debhelper.log
 debian/*.substvars
-debian/pipewire-net-zeroconf-publish/
-debian/pipewire-net-zeroconf-discover/
-debian/pipewire-net-zeroconf/
+debian/pipewire-rtp-zeroconf-publish/
+debian/pipewire-rtp-zeroconf-discover/
+debian/pipewire-rtp-zeroconf/
 debian/tmp/
 debian/debhelper-build-stamp
 debian/*.postinst.debhelper
@@ -19,14 +19,14 @@ debian/*.postrm.debhelper
 debian/*.prerm.debhelper
 
 # source tarballs / parent dir build outputs
-../pipewire-net-zeroconf_*.deb
-../pipewire-net-zeroconf_*.changes
-../pipewire-net-zeroconf_*.buildinfo
-../pipewire-net-zeroconf_*.tar.*
-../pipewire-net-zeroconf_*.dsc
-../pipewire-net-zeroconf-*_*.deb
-../pipewire-net-zeroconf-*_*.changes
-../pipewire-net-zeroconf-*_*.buildinfo
+../pipewire-rtp-zeroconf_*.deb
+../pipewire-rtp-zeroconf_*.changes
+../pipewire-rtp-zeroconf_*.buildinfo
+../pipewire-rtp-zeroconf_*.tar.*
+../pipewire-rtp-zeroconf_*.dsc
+../pipewire-rtp-zeroconf-*_*.deb
+../pipewire-rtp-zeroconf-*_*.changes
+../pipewire-rtp-zeroconf-*_*.buildinfo
 
 # editor / IDE
 *.swp

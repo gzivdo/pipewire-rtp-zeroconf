@@ -1,2 +1,0 @@
-usr/lib/*/pipewire-0.3/libpipewire-module-mdns-rtp-publish.so
-usr/share/pipewire/pipewire.conf.d/30-net-zeroconf-publish.conf

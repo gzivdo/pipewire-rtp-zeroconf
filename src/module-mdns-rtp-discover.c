@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT
  *
- * pipewire-net-zeroconf — mDNS/RTP discover module.
+ * pipewire-rtp-zeroconf — mDNS/RTP discover module.
  *
  * Browses Avahi for _pipewire-rtp._udp services and, for each peer
  * card, instantiates a local virtual Audio/Sink (libpipewire-module-rtp-sink)
@@ -37,10 +37,10 @@
 #include "peer-device.h"
 
 /* Metadata key prefix for runtime per-peer-card toggles.
- *   pipewire-net-zeroconf.discover.<peer-host>.<peer-node>.enabled = "true"|"false"
+ *   pipewire-rtp-zeroconf.discover.<peer-host>.<peer-node>.enabled = "true"|"false"
  * Subject = 0. Default (key absent) = enabled.
  */
-#define PWNZ_META_PREFIX        "pipewire-net-zeroconf.discover."
+#define PWNZ_META_PREFIX        "pipewire-rtp-zeroconf.discover."
 #define PWNZ_META_SUFFIX_EN     ".enabled"
 #define PWNZ_META_SUFFIX_PROF   ".profile"
 /* (Variant 4 used PWNZ_META_SUFFIX; that constant stayed for the
@@ -59,7 +59,7 @@ PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
 	"( discover.protocol=<ipv4|ipv6|any, default ipv4> ) "
 
 static const struct spa_dict_item module_props[] = {
-	{ PW_KEY_MODULE_AUTHOR, "pipewire-net-zeroconf" },
+	{ PW_KEY_MODULE_AUTHOR, "pipewire-rtp-zeroconf" },
 	{ PW_KEY_MODULE_DESCRIPTION, "Discover remote PipeWire audio over mDNS+RTP" },
 	{ PW_KEY_MODULE_USAGE, MODULE_USAGE },
 	{ PW_KEY_MODULE_VERSION, PACKAGE_VERSION },
@@ -1376,7 +1376,7 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	pw_impl_module_update_properties(module, &SPA_DICT_INIT_ARRAY(module_props));
 
 	/* Connect to PW + bind default metadata so we can listen for
-	 * per-peer toggle keys (pipewire-net-zeroconf.discover.*.enabled).
+	 * per-peer toggle keys (pipewire-rtp-zeroconf.discover.*.enabled).
 	 * Failures here are non-fatal — the module still works without
 	 * runtime toggle support. */
 	impl->core = pw_context_connect(context, NULL, 0);

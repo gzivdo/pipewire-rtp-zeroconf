@@ -1,0 +1,2 @@
+usr/lib/*/pipewire-0.3/libpipewire-module-mdns-rtp-discover.so
+usr/share/pipewire/pipewire.conf.d/31-rtp-zeroconf-discover.conf
