@@ -1,6 +1,6 @@
 # Profile-flip fix: cache invalidation + dedup + property sync
 
-Дата: 2026-05-17. Версии: PW 1.0.5 (workpc / Ubuntu 24.04), PW 1.6.2 (uvi / Ubuntu 26.04), WirePlumber 0.4.17.
+Дата: 2026-05-17. Версии: PW 1.0.5 (test-pc1 / Ubuntu 24.04), PW 1.6.2 (test-pc2 / Ubuntu 26.04), WirePlumber 0.4.17.
 
 ## Симптом
 
