@@ -57,6 +57,7 @@ PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
 #define MODULE_USAGE \
 	"( publish.sink=<bool, default true> ) " \
 	"( publish.source=<bool, default false> ) " \
+	"( publish.protocol=<ipv4|ipv6|any, default ipv4> ) " \
 	"( publish.rules=<match-action rules> ) " \
 	"( publish.rate=<int, default 48000> ) " \
 	"( publish.channels=<int, default 2> ) " \
@@ -109,6 +110,15 @@ struct meta_entry {
 	bool enabled;
 };
 
+/* Snapshot of a Device global so that, when a child Node global
+ * arrives, we can resolve its parent device.name (the stable card
+ * identifier we want to group sink and source nodes by). */
+struct local_device {
+	struct spa_list link;
+	uint32_t id;
+	char *device_name;
+};
+
 /* One subscriber that asked us (via mDNS request-record) to stream a
  * specific local mic card to it over unicast. We load one rtp-sink per
  * incoming_request, destination = requester's resolved IP+port. */
@@ -146,7 +156,9 @@ struct impl {
 	AvahiPoll *avahi_poll;
 	AvahiClient *avahi_client;
 	AvahiServiceBrowser *req_browser;
+	AvahiProtocol publish_protocol;  /* INET / INET6 / UNSPEC for the req browser */
 	struct spa_list incoming_requests;
+	struct spa_list local_devices;
 
 	char host_name[HOST_NAME_MAX + 1];
 
@@ -313,6 +325,22 @@ static struct service *find_service_by_id(struct impl *impl, uint32_t id)
 	return NULL;
 }
 
+static struct local_device *find_local_device(struct impl *impl, uint32_t id)
+{
+	struct local_device *d;
+	spa_list_for_each(d, &impl->local_devices, link)
+		if (d->id == id)
+			return d;
+	return NULL;
+}
+
+static void local_device_free(struct local_device *d)
+{
+	spa_list_remove(&d->link);
+	free(d->device_name);
+	free(d);
+}
+
 /* match-rules callback: a rule matched, action is "publish" or "exclude".
  * Stores the decision in match_info and stops further evaluation by
  * leaving the loop on first match (callback is invoked per matching
@@ -411,6 +439,25 @@ static void registry_global(void *data, uint32_t id,
 	struct impl *impl = data;
 	bool is_sink;
 
+	/* Snapshot Device globals so we can map node→parent device.name
+	 * later for card-name grouping. */
+	if (spa_streq(type, PW_TYPE_INTERFACE_Device)) {
+		const char *name = props ? spa_dict_lookup(props, PW_KEY_DEVICE_NAME) : NULL;
+		if (name == NULL)
+			return;
+		struct local_device *d = find_local_device(impl, id);
+		if (d == NULL) {
+			d = calloc(1, sizeof(*d));
+			if (d == NULL)
+				return;
+			d->id = id;
+			spa_list_append(&impl->local_devices, &d->link);
+		}
+		free(d->device_name);
+		d->device_name = strdup(name);
+		return;
+	}
+
 	/* Bind the default metadata once we see it in the registry. */
 	if (spa_streq(type, PW_TYPE_INTERFACE_Metadata)) {
 		if (impl->metadata != NULL || props == NULL)
@@ -466,7 +513,22 @@ static void registry_global(void *data, uint32_t id,
 	if (s == NULL)
 		return;
 
-	const char *card = spa_dict_lookup(props, PW_KEY_DEVICE_NAME);
+	/* card identifier: prefer the parent PW Device's device.name (so a
+	 * sink and a source belonging to the same ALSA card group under
+	 * one peer_card on the discover side). Fall back to:
+	 *   - the node's own device.name (rare; happens for some virtual
+	 *     adapter nodes), then
+	 *   - the node.name itself (orphan virtuals — every one is its
+	 *     own "card"). */
+	const char *card = NULL;
+	const char *dev_id_str = spa_dict_lookup(props, PW_KEY_DEVICE_ID);
+	uint32_t dev_id = 0;
+	if (dev_id_str && spa_atou32(dev_id_str, &dev_id, 10)) {
+		struct local_device *d = find_local_device(impl, dev_id);
+		if (d) card = d->device_name;
+	}
+	if (card == NULL)
+		card = spa_dict_lookup(props, PW_KEY_DEVICE_NAME);
 	if (card == NULL)
 		card = node_name;
 
@@ -507,10 +569,17 @@ static void registry_global_remove(void *data, uint32_t id)
 	}
 
 	struct service *s = find_service_by_id(impl, id);
-	if (s == NULL)
+	if (s != NULL) {
+		pw_log_info("local node id=%u gone — unpublishing", id);
+		service_free(s);
 		return;
-	pw_log_info("local node id=%u gone — unpublishing", id);
-	service_free(s);
+	}
+
+	struct local_device *d = find_local_device(impl, id);
+	if (d != NULL) {
+		pw_log_debug("local device id=%u gone", id);
+		local_device_free(d);
+	}
 }
 
 /* -- metadata events -------------------------------------------------- */
@@ -1096,7 +1165,7 @@ static void req_browser_cb(AvahiServiceBrowser *b SPA_UNUSED,
 			return;
 		if (!avahi_service_resolver_new(impl->avahi_client,
 						iface, proto, name, type, domain,
-						AVAHI_PROTO_UNSPEC, 0,
+						impl->publish_protocol, 0,
 						req_resolver_cb, impl)) {
 			pw_log_error("avahi_service_resolver_new (req): %s",
 				     avahi_strerror(avahi_client_errno(impl->avahi_client)));
@@ -1119,7 +1188,7 @@ static int start_req_browser(struct impl *impl)
 	if (impl->req_browser != NULL)
 		return 0;
 	impl->req_browser = avahi_service_browser_new(
-		impl->avahi_client, AVAHI_IF_UNSPEC, AVAHI_PROTO_UNSPEC,
+		impl->avahi_client, AVAHI_IF_UNSPEC, impl->publish_protocol,
 		PWNZ_REQUEST_SERVICE_TYPE, NULL, 0, req_browser_cb, impl);
 	if (impl->req_browser == NULL) {
 		pw_log_error("avahi_service_browser_new (req): %s",
@@ -1215,11 +1284,14 @@ static void impl_free(struct impl *impl)
 	struct service *s;
 	struct meta_entry *e;
 	struct incoming_request *r;
+	struct local_device *d;
 
 	spa_list_consume(r, &impl->incoming_requests, link)
 		incoming_request_free(r);
 	spa_list_consume(s, &impl->services, link)
 		service_free(s);
+	spa_list_consume(d, &impl->local_devices, link)
+		local_device_free(d);
 	spa_list_consume(e, &impl->meta_entries, link)
 		meta_entry_free(e);
 
@@ -1306,6 +1378,7 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	spa_list_init(&impl->services);
 	spa_list_init(&impl->meta_entries);
 	spa_list_init(&impl->incoming_requests);
+	spa_list_init(&impl->local_devices);
 
 	if (gethostname(impl->host_name, sizeof(impl->host_name)) < 0)
 		snprintf(impl->host_name, sizeof(impl->host_name), "pipewire");
@@ -1352,6 +1425,14 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	impl->next_port_offset = 0;
 
 	impl->sap_enabled = pw_properties_get_bool(props, "publish.sap", false);
+
+	const char *proto = pw_properties_get(props, "publish.protocol");
+	if (proto == NULL || spa_streq(proto, "ipv4"))
+		impl->publish_protocol = AVAHI_PROTO_INET;
+	else if (spa_streq(proto, "ipv6"))
+		impl->publish_protocol = AVAHI_PROTO_INET6;
+	else
+		impl->publish_protocol = AVAHI_PROTO_UNSPEC;
 	if (impl->sap_enabled && !impl->multicast) {
 		pw_log_warn("publish.sap requires publish.transport=multicast; disabling SAP");
 		impl->sap_enabled = false;
