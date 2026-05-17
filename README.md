@@ -49,6 +49,14 @@ discovered remote card, named `Network: <peer-host>: <card description>`,
 which apps can target via `pavucontrol` or by setting it as default with
 `wpctl set-default <id>`.
 
+> **Finding network streams in pavucontrol.** The in-process RTP
+> streams that move audio between hosts (the receiver-side `net-rx ...`
+> on a publish host, the back-channel `net-tx (req) ...` on a publish
+> host) are **virtual streams**, not application streams, so they do
+> not appear under the default *Playback* / *Recording* views. Switch
+> the *Show* dropdown at the bottom of pavucontrol to **Virtual
+> Streams** (or *All Streams*) to see and volume-adjust them.
+
 ## Build (without packaging)
 
 ```bash
