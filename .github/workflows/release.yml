@@ -16,7 +16,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-26.04]
+        # See build.yml — only ubuntu-24.04 is a real runner yet.
+        os: [ubuntu-24.04]
     steps:
       - uses: actions/checkout@v4
 
@@ -24,7 +25,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            devscripts debhelper dpkg-dev fakeroot \
+            devscripts debhelper dpkg-dev fakeroot build-essential \
             meson ninja-build pkgconf \
             libpipewire-0.3-dev libspa-0.2-dev libavahi-client-dev
 
