@@ -19,7 +19,14 @@
 #include <spa/param/profile.h>
 #include <spa/pod/builder.h>
 #include <spa/pod/parser.h>
+/* spa/pod/filter.h transitively pulls spa/pod/compare.h, which has an
+ * `unused parameter 'size'` in spa_pod_compare_is_step_of (upstream spa
+ * 0.2 header bug, present in Ubuntu 26.04). Silence just for this
+ * include — our own code is still built with -Wunused-parameter. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-parameter"
 #include <spa/pod/filter.h>
+#pragma GCC diagnostic pop
 
 #include <pipewire/pipewire.h>
 #include <pipewire/impl.h>

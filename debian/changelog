@@ -1,3 +1,27 @@
+pipewire-rtp-zeroconf (0.1.6-1) unstable; urgency=medium
+
+  * discover: input on demand (Stage 25). The back-channel Avahi request
+    (which makes the publish host open its mic and stream over the
+    network) is now published only while a local application is actually
+    recording from the virtual mic node. Previously, picking the Input
+    profile in pavucontrol caused the publish host to stream mic audio
+    24/7 even when nothing on the discover side was consuming it.
+    Implementation: after the rtp-source child module creates its
+    virtual-mic pw_impl_node we listen for state_changed via the
+    in-process global; PW_NODE_STATE_RUNNING → publish the request,
+    anything else → withdraw with a 1.5s debounce so a quick app
+    stop/start (pavucontrol level test, app reconnect) does not churn
+    the publish-side ALSA open/close.
+    Configurable via discover.source-on-demand (default true); set false
+    in a drop-in conf to restore the legacy always-on-while-Input-profile
+    behaviour.
+  * peer-device: suppress -Wunused-parameter for the spa/pod/filter.h
+    include (the included spa/pod/compare.h has an unused-parameter in
+    spa_pod_compare_is_step_of in spa-0.2 0.2 shipped on Ubuntu 26.04,
+    upstream header bug). Local code still built with -Wunused-parameter.
+
+ -- pipewire-rtp-zeroconf <maintainer@example.invalid>  Sun, 17 May 2026 16:00:00 +0000
+
 pipewire-rtp-zeroconf (0.1.5-1) unstable; urgency=medium
 
   * Rename project, source package, binary packages and drop-in confs

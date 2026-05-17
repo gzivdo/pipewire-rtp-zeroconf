@@ -55,6 +55,7 @@ PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
 #define MODULE_USAGE \
 	"( discover.sink=<bool, default true> ) " \
 	"( discover.source=<bool, default false> ) " \
+	"( discover.source-on-demand=<bool, default true> ) " \
 	"( discover.local=<bool, default false> ) " \
 	"( discover.protocol=<ipv4|ipv6|any, default ipv4> ) "
 
@@ -93,6 +94,16 @@ struct tunnel {
 
 	struct pw_impl_module *rtp_mod;
 	struct spa_hook rtp_mod_listener;
+
+	/* On-demand input: track the local virtual mic node created by
+	 * libpipewire-module-rtp-source so we only publish the back-channel
+	 * Avahi request while an application is actually consuming audio
+	 * from it. Meaningful for source-mode tunnels only. */
+	char  *local_node_name;          /* expected PW_KEY_NODE_NAME */
+	struct pw_impl_node *local_node; /* bound after registry sees it */
+	struct spa_hook local_node_listener;
+	uint32_t local_node_id;          /* registry global id, 0 = unbound */
+	bool   local_node_running;       /* PW_NODE_STATE_RUNNING */
 };
 
 /* Aggregates all directions of one peer card into a single PipeWire
@@ -126,6 +137,12 @@ struct peer_card {
 	uint16_t req_port;            /* local UDP port advertised in request */
 	char req_service_name[128];
 	int req_collision_count;
+
+	/* Debounce timer for on-demand withdraw: when local virtual mic
+	 * goes idle we wait ~1.5s before pulling the Avahi request so a
+	 * quick stop/start (pavucontrol level test, app reconnect) doesn't
+	 * churn the publish side's ALSA mic open/close. NULL when unarmed. */
+	struct spa_source *req_withdraw_timer;
 };
 
 struct meta_entry {
@@ -159,9 +176,16 @@ struct impl {
 	AvahiClient *avahi_client;
 	AvahiServiceBrowser *browser;
 
+	struct pw_loop *loop;            /* main loop (for debounce timers) */
+
 	bool discover_sink;
 	bool discover_source;
 	bool discover_local;
+	bool source_on_demand;           /* default true: publish back-channel
+					  * request only while a local app is
+					  * actively recording from the virtual
+					  * mic. false = legacy always-on while
+					  * profile=Input. */
 	AvahiProtocol discover_protocol;  /* AVAHI_PROTO_INET | INET6 | UNSPEC */
 
 	double   ptime_ms;
@@ -176,6 +200,7 @@ struct impl {
 
 static int start_avahi_client(struct impl *impl);
 static void tunnel_free(struct tunnel *t);
+static void tunnel_clear_local_node(struct tunnel *t);
 static void peer_card_free(struct peer_card *c);
 static int load_local_endpoint(struct tunnel *t,
 			       const char *peer_addr, uint16_t peer_port,
@@ -328,6 +353,11 @@ static char *sanitize_for_node_name(const char *s)
 
 static void unload_local_endpoint(struct tunnel *t)
 {
+	/* Drop the local_node listener BEFORE destroying the rtp module —
+	 * pw_impl_module_destroy tears down the stream's impl-node, which
+	 * would fire local_node_destroyed at us anyway, but doing it here
+	 * avoids any ordering surprise if WP holds references. */
+	tunnel_clear_local_node(t);
 	if (t->rtp_mod) {
 		spa_hook_remove(&t->rtp_mod_listener);
 		pw_impl_module_destroy(t->rtp_mod);
@@ -351,6 +381,57 @@ static void tunnel_set_loaded(struct tunnel *t, bool loaded)
 	} else {
 		unload_local_endpoint(t);
 	}
+}
+
+/* -- on-demand input: track local virtual mic node ------------------ */
+
+static void card_update_request(struct peer_card *c);
+
+static void local_node_destroyed(void *data)
+{
+	struct tunnel *t = data;
+	if (t->local_node == NULL)
+		return;       /* already cleared via tunnel_clear_local_node */
+	spa_hook_remove(&t->local_node_listener);
+	t->local_node = NULL;
+	t->local_node_id = 0;
+	t->local_node_running = false;
+	if (t->card)
+		card_update_request(t->card);
+}
+
+static void local_node_state_changed(void *data,
+				     enum pw_node_state old SPA_UNUSED,
+				     enum pw_node_state state,
+				     const char *error SPA_UNUSED)
+{
+	struct tunnel *t = data;
+	bool running = (state == PW_NODE_STATE_RUNNING);
+	if (running == t->local_node_running)
+		return;
+	t->local_node_running = running;
+	pw_log_info("on-demand: '%s' → %s", t->local_node_name,
+		    pw_node_state_as_string(state));
+	if (t->card)
+		card_update_request(t->card);
+}
+
+static const struct pw_impl_node_events local_node_events = {
+	PW_VERSION_IMPL_NODE_EVENTS,
+	.destroy = local_node_destroyed,
+	.state_changed = local_node_state_changed,
+};
+
+static void tunnel_clear_local_node(struct tunnel *t)
+{
+	if (t->local_node != NULL) {
+		spa_hook_remove(&t->local_node_listener);
+		t->local_node = NULL;
+	}
+	t->local_node_id = 0;
+	t->local_node_running = false;
+	free(t->local_node_name);
+	t->local_node_name = NULL;
 }
 
 /* -- Avahi request-record (Stage 24b unicast back-channel) ---------- */
@@ -462,9 +543,16 @@ static void card_withdraw_request(struct peer_card *c)
 	}
 }
 
-/* Should this card maintain an outgoing request right now? Only if
- * Input direction is active AND at least one source-mode tunnel uses
- * unicast transport (peer's announcement). */
+/* Should this card maintain an outgoing request right now?
+ *
+ * Always required: Input direction is active AND at least one source-mode
+ * tunnel uses unicast transport.
+ *
+ * When source_on_demand is enabled (default), additionally require that
+ * at least one matching tunnel's local virtual mic node is in
+ * PW_NODE_STATE_RUNNING — i.e. a local app is actually recording. This
+ * stops the publish host from streaming mic audio over the network 24/7
+ * while nothing on this host is consuming it. */
 static bool card_needs_request(struct peer_card *c)
 {
 	uint32_t active = c->device ? peer_device_get_active_dirs(c->device) : 0;
@@ -475,18 +563,69 @@ static bool card_needs_request(struct peer_card *c)
 		if (t->is_sink_mode)
 			continue;
 		bool is_mc = t->transport && spa_streq(t->transport, "multicast");
-		if (!is_mc)
-			return true;
+		if (is_mc)
+			continue;
+		if (c->impl->source_on_demand) {
+			if (t->rtp_mod == NULL)
+				continue;       /* tunnel not loaded yet */
+			if (!t->local_node_running)
+				continue;       /* nobody recording */
+		}
+		return true;
 	}
 	return false;
 }
 
+static void req_withdraw_timer_cb(void *userdata, uint64_t expirations SPA_UNUSED)
+{
+	struct peer_card *c = userdata;
+	struct impl *impl = c->impl;
+	if (c->req_withdraw_timer) {
+		pw_loop_destroy_source(impl->loop, c->req_withdraw_timer);
+		c->req_withdraw_timer = NULL;
+	}
+	/* Re-evaluate: a record stream may have re-attached while we waited. */
+	if (!card_needs_request(c))
+		card_withdraw_request(c);
+}
+
+static void card_cancel_withdraw_timer(struct peer_card *c)
+{
+	if (c->req_withdraw_timer) {
+		pw_loop_destroy_source(c->impl->loop, c->req_withdraw_timer);
+		c->req_withdraw_timer = NULL;
+	}
+}
+
 static void card_update_request(struct peer_card *c)
 {
-	if (card_needs_request(c))
-		card_publish_request(c);
-	else
+	bool needs = card_needs_request(c);
+	if (needs) {
+		card_cancel_withdraw_timer(c);
+		if (c->req_entry_group == NULL)
+			card_publish_request(c);
+		return;
+	}
+	if (c->req_entry_group == NULL)
+		return;       /* nothing to withdraw */
+	/* Legacy (always-on) path: withdraw immediately when profile flips
+	 * off. On-demand path: debounce ~1.5s so a quick app stop/start does
+	 * not churn the publish-side ALSA open/close. */
+	if (!c->impl->source_on_demand) {
 		card_withdraw_request(c);
+		return;
+	}
+	if (c->req_withdraw_timer != NULL)
+		return;       /* already armed */
+	c->req_withdraw_timer = pw_loop_add_timer(c->impl->loop,
+						  req_withdraw_timer_cb, c);
+	if (c->req_withdraw_timer == NULL) {
+		card_withdraw_request(c);
+		return;
+	}
+	struct timespec v = { .tv_sec = 1, .tv_nsec = 500 * 1000 * 1000 };
+	pw_loop_update_timer(c->impl->loop, c->req_withdraw_timer,
+			     &v, NULL, false);
 }
 
 /* Called by peer_device when the user picks a new profile via
@@ -620,6 +759,13 @@ static int load_local_endpoint(struct tunnel *t,
 		fprintf(f, "} }");
 	} else {
 		child_mod = "libpipewire-module-rtp-source";
+		/* Remember the exact node.name we hand to rtp-source so we can
+		 * match the resulting global in the registry and listen for
+		 * its state changes for on-demand request gating. */
+		free(t->local_node_name);
+		if (asprintf(&t->local_node_name, "network.%s.%s",
+			     peer_host_safe, peer_node_safe) < 0)
+			t->local_node_name = NULL;
 		fprintf(f, "{ ");
 		fprintf(f, "source.ip = \"%s\" ", net_addr);
 		fprintf(f, "source.port = %u ", peer_port);
@@ -995,6 +1141,7 @@ static void peer_card_free(struct peer_card *c)
 {
 	if (c == NULL)
 		return;
+	card_cancel_withdraw_timer(c);
 	card_withdraw_request(c);
 	struct tunnel *t;
 	spa_list_consume(t, &c->tunnels, link) {
@@ -1199,6 +1346,55 @@ static void registry_global(void *data,
 {
 	struct impl *impl = data;
 
+	/* On-demand input: when our virtual mic node appears in the registry,
+	 * grab its in-process pw_impl_node and listen for state changes so
+	 * we can gate the back-channel Avahi request on whether a local app
+	 * is actively consuming audio. */
+	if (impl->source_on_demand && props != NULL &&
+	    spa_streq(type, PW_TYPE_INTERFACE_Node)) {
+		const char *nn = spa_dict_lookup(props, PW_KEY_NODE_NAME);
+		if (nn != NULL) {
+			struct tunnel *t;
+			spa_list_for_each(t, &impl->tunnels, impl_link) {
+				if (t->is_sink_mode)
+					continue;
+				if (t->local_node != NULL)
+					continue;
+				if (t->local_node_name == NULL)
+					continue;
+				if (!spa_streq(t->local_node_name, nn))
+					continue;
+				struct pw_global *g =
+					pw_context_find_global(impl->context, id);
+				if (g == NULL)
+					break;
+				if (!spa_streq(pw_global_get_type(g),
+					       PW_TYPE_INTERFACE_Node))
+					break;
+				void *obj = pw_global_get_object(g);
+				if (obj == NULL)
+					break;
+				t->local_node = obj;
+				t->local_node_id = id;
+				pw_impl_node_add_listener(t->local_node,
+							  &t->local_node_listener,
+							  &local_node_events, t);
+				const struct pw_node_info *info =
+					pw_impl_node_get_info(t->local_node);
+				if (info)
+					t->local_node_running =
+					   (info->state == PW_NODE_STATE_RUNNING);
+				pw_log_info("on-demand: bound '%s' id=%u state=%s",
+					    nn, id,
+					    info ? pw_node_state_as_string(info->state)
+					         : "?");
+				if (t->local_node_running && t->card)
+					card_update_request(t->card);
+				break;
+			}
+		}
+	}
+
 	if (!spa_streq(type, PW_TYPE_INTERFACE_Metadata) || props == NULL)
 		return;
 	if (impl->metadata != NULL)
@@ -1340,6 +1536,7 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	impl->props = props;
 	impl->metadata_id = SPA_ID_INVALID;
 	impl->req_next_port = PWNZ_DEFAULT_PORT_BASE + PWNZ_DEFAULT_PORT_RANGE;
+	impl->loop = pw_context_get_main_loop(context);
 	spa_list_init(&impl->tunnels);
 	spa_list_init(&impl->cards);
 	spa_list_init(&impl->meta_entries);
@@ -1348,9 +1545,11 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 		snprintf(impl->host_name, sizeof(impl->host_name), "pipewire");
 	impl->host_name[sizeof(impl->host_name) - 1] = '\0';
 
-	impl->discover_sink   = pw_properties_get_bool(props, "discover.sink",   true);
-	impl->discover_source = pw_properties_get_bool(props, "discover.source", false);
-	impl->discover_local  = pw_properties_get_bool(props, "discover.local",  false);
+	impl->discover_sink     = pw_properties_get_bool(props, "discover.sink",   true);
+	impl->discover_source   = pw_properties_get_bool(props, "discover.source", false);
+	impl->discover_local    = pw_properties_get_bool(props, "discover.local",  false);
+	impl->source_on_demand  = pw_properties_get_bool(props,
+						"discover.source-on-demand", true);
 
 	impl->latency_ms = pw_properties_get_uint32(props,
 					"discover.latency.msec", PWNZ_DEFAULT_LATENCY_MS);
@@ -1367,8 +1566,10 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	else
 		impl->discover_protocol = AVAHI_PROTO_UNSPEC;
 
-	pw_log_info("discover.sink=%d discover.source=%d discover.local=%d protocol=%s",
+	pw_log_info("discover.sink=%d discover.source=%d discover.local=%d "
+		    "source-on-demand=%d protocol=%s",
 		    impl->discover_sink, impl->discover_source, impl->discover_local,
+		    impl->source_on_demand,
 		    proto_str ? proto_str : "ipv4");
 
 	pw_impl_module_add_listener(module, &impl->module_listener,
