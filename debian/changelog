@@ -1,3 +1,20 @@
+pipewire-net-zeroconf (0.1.3-1) unstable; urgency=medium
+
+  * peer-device: impl_add_listener now forces a full change_mask
+    (PROPS|PARAMS) before the first emit_info, mirroring
+    alsa-acp-device.c's full=true path. Without this a peer_device that
+    was created from an Avahi service and never set_param'd (e.g. an
+    Output-only HDMI/DP card with no user click) shipped to clients with
+    params:(0) — EnumProfile/Profile never reached pavucontrol, the
+    card showed up at the bottom of the config tab with an empty
+    profile combo. Triggered by HDMI subdevice transitions (acp swaps
+    hdmi-stereo → hdmi-stereo-extra1 reusing the PW node id; our
+    discover side correctly destroys+recreates the peer_card and
+    peer_device, but the new device's first listener wasn't getting
+    PARAMS bit so its profile list never showed up).
+
+ -- pipewire-net-zeroconf <maintainer@example.invalid>  Sun, 17 May 2026 13:40:00 +0000
+
 pipewire-net-zeroconf (0.1.2-1) unstable; urgency=medium
 
   * peer-device: persistent spa_device_info + spa_param_info[] in struct,

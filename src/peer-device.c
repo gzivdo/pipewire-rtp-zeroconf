@@ -201,8 +201,18 @@ static int impl_add_listener(void *object, struct spa_hook *listener,
 	struct peer_device *this = object;
 	struct spa_hook_list save;
 	spa_hook_list_isolate(&this->hooks, &save, listener, events, data);
-	if (events->info)
+	if (events->info) {
+		/* Force full info on every new listener — pw_impl_device
+		 * (and on subsequent re-binds, pavucontrol via PA-bridge)
+		 * needs to see both PROPS and PARAMS so it populates
+		 * EnumProfile/Profile in its cache. Without this a peer_device
+		 * that's created from Avahi without a subsequent set_param
+		 * (e.g. an Output-only HDMI card with no user click) ends
+		 * up with params:(0) and an empty profile dropdown. */
+		this->info.change_mask = SPA_DEVICE_CHANGE_MASK_PROPS |
+					 SPA_DEVICE_CHANGE_MASK_PARAMS;
 		emit_info(this);
+	}
 	spa_hook_list_join(&this->hooks, &save);
 	return 0;
 }
