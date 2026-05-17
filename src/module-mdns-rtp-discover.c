@@ -40,8 +40,12 @@
  *   pipewire-net-zeroconf.discover.<peer-host>.<peer-node>.enabled = "true"|"false"
  * Subject = 0. Default (key absent) = enabled.
  */
-#define PWNZ_META_PREFIX  "pipewire-net-zeroconf.discover."
-#define PWNZ_META_SUFFIX  ".enabled"
+#define PWNZ_META_PREFIX        "pipewire-net-zeroconf.discover."
+#define PWNZ_META_SUFFIX_EN     ".enabled"
+#define PWNZ_META_SUFFIX_PROF   ".profile"
+/* (Variant 4 used PWNZ_META_SUFFIX; that constant stayed for the
+ * boolean enable key. Profile string key added in Stage 24 follow-up.) */
+#define PWNZ_META_SUFFIX        PWNZ_META_SUFFIX_EN
 
 #define NAME "mdns-rtp-discover"
 
@@ -119,8 +123,11 @@ struct peer_card {
 
 struct meta_entry {
 	struct spa_list link;
-	char *key_tail;   /* peer-host.peer-node */
-	bool enabled;
+	char *key_tail;   /* peer-host.peer-card */
+	bool  enabled_set;
+	bool  enabled;
+	bool  profile_set;
+	char *profile_str;
 };
 
 struct impl {
@@ -210,14 +217,62 @@ static bool is_enabled(struct impl *impl, const char *peer_host, const char *car
 		return true;
 	struct meta_entry *e = meta_find(impl, kt);
 	free(kt);
-	return e == NULL ? true : e->enabled;
+	return e == NULL || !e->enabled_set ? true : e->enabled;
+}
+
+/* Returns -1 if no stored profile; otherwise a bitmask of PEER_DIR_*. */
+static int stored_profile(struct impl *impl, const char *peer_host,
+			  const char *card_name)
+{
+	char *kt = make_key_tail(peer_host, card_name);
+	if (kt == NULL)
+		return -1;
+	struct meta_entry *e = meta_find(impl, kt);
+	free(kt);
+	if (e == NULL || !e->profile_set || e->profile_str == NULL)
+		return -1;
+	if (spa_streq(e->profile_str, "off"))          return 0;
+	if (spa_streq(e->profile_str, "output"))       return PEER_DIR_OUTPUT;
+	if (spa_streq(e->profile_str, "input"))        return PEER_DIR_INPUT;
+	if (spa_streq(e->profile_str, "output+input")) return PEER_DIR_OUTPUT | PEER_DIR_INPUT;
+	return -1;
 }
 
 static void meta_entry_free(struct meta_entry *e)
 {
 	spa_list_remove(&e->link);
 	free(e->key_tail);
+	free(e->profile_str);
 	free(e);
+}
+
+static const char *dirs_to_profile_name(uint32_t dirs)
+{
+	switch (dirs) {
+	case 0:                                   return "off";
+	case PEER_DIR_OUTPUT:                     return "output";
+	case PEER_DIR_INPUT:                      return "input";
+	case PEER_DIR_OUTPUT | PEER_DIR_INPUT:    return "output+input";
+	default: return NULL;
+	}
+}
+
+/* Write our chosen profile to PW metadata so it survives module reload
+ * (or peer-down/up). No-op if metadata not bound (= no WP running). */
+static void persist_profile(struct impl *impl,
+			    const char *peer_host, const char *card_name,
+			    uint32_t active_dirs)
+{
+	if (impl->metadata == NULL)
+		return;
+	const char *name = dirs_to_profile_name(active_dirs);
+	if (name == NULL)
+		return;
+	char key[256];
+	snprintf(key, sizeof(key), "%s%s.%s%s",
+		 PWNZ_META_PREFIX, peer_host, card_name, PWNZ_META_SUFFIX_PROF);
+	pw_metadata_set_property((struct pw_metadata *) impl->metadata,
+				 PW_ID_CORE, key, "Spa:String:JSON", name);
 }
 
 /* -- helpers ----------------------------------------------------------- */
@@ -438,6 +493,7 @@ static int card_profile_cb(void *user_data, uint32_t active_dirs)
 		tunnel_set_loaded(t, (active_dirs & need) != 0);
 	}
 	card_update_request(c);
+	persist_profile(c->impl, c->peer_host, c->card_name, active_dirs);
 	return 0;
 }
 
@@ -725,14 +781,21 @@ static void resolver_cb(AvahiServiceResolver *r,
 		snprintf(description, sizeof(description), "Network: %s: %s",
 			 card->peer_host, card->description);
 
+		uint32_t initial_dirs;
+		int saved = stored_profile(impl, card->peer_host, card->card_name);
+		if (saved >= 0) {
+			initial_dirs = (uint32_t) saved & card->available_dirs;
+		} else {
+			initial_dirs = is_enabled(impl, card->peer_host,
+						  card->card_name)
+				       ? card_default_dirs(card) : 0;
+		}
 		struct peer_device_info pdi = {
 			.node_name        = node_name,
 			.node_description = description,
 			.peer_host        = card->peer_host,
 			.available_dirs   = card->available_dirs,
-			.default_dirs     = is_enabled(impl, card->peer_host,
-						       card->card_name)
-						? card_default_dirs(card) : 0,
+			.default_dirs     = initial_dirs,
 		};
 		card->device = peer_device_new(impl->context, &pdi,
 					       card_profile_cb, card);
@@ -981,49 +1044,89 @@ static int meta_property(void *data, uint32_t subject,
 		return 0;
 	const char *tail = key + sizeof(PWNZ_META_PREFIX) - 1;
 	size_t tail_len = strlen(tail);
-	size_t suf_len = sizeof(PWNZ_META_SUFFIX) - 1;
-	if (tail_len < suf_len ||
-	    strcmp(tail + tail_len - suf_len, PWNZ_META_SUFFIX) != 0)
+
+	bool is_profile_key;
+	size_t suf_len;
+	if (tail_len >= sizeof(PWNZ_META_SUFFIX_PROF) - 1 &&
+	    strcmp(tail + tail_len - (sizeof(PWNZ_META_SUFFIX_PROF) - 1),
+		   PWNZ_META_SUFFIX_PROF) == 0) {
+		is_profile_key = true;
+		suf_len = sizeof(PWNZ_META_SUFFIX_PROF) - 1;
+	} else if (tail_len >= sizeof(PWNZ_META_SUFFIX_EN) - 1 &&
+		   strcmp(tail + tail_len - (sizeof(PWNZ_META_SUFFIX_EN) - 1),
+			  PWNZ_META_SUFFIX_EN) == 0) {
+		is_profile_key = false;
+		suf_len = sizeof(PWNZ_META_SUFFIX_EN) - 1;
+	} else {
 		return 0;
+	}
+
 	size_t kt_len = tail_len - suf_len;
 	char *kt = strndup(tail, kt_len);
 	if (kt == NULL)
 		return -ENOMEM;
-
-	/* kt = "peer_host.peer_node". Cache it as-is for meta_find lookup,
-	 * then split into peer_host / peer_node for tunnel matching. */
 	char *dot = strchr(kt, '.');
-	if (dot == NULL) {
-		free(kt);
-		return 0;
-	}
+	if (dot == NULL) { free(kt); return 0; }
 
 	struct meta_entry *e = meta_find(impl, kt);
 
-	if (value == NULL) {
-		if (e) {
-			pw_log_info("metadata key cleared: %s", kt);
-			meta_entry_free(e);
+	if (is_profile_key) {
+		if (value == NULL) {
+			if (e && e->profile_set) {
+				pw_log_info("metadata profile cleared: %s", kt);
+				e->profile_set = false;
+				free(e->profile_str);
+				e->profile_str = NULL;
+			}
+		} else {
+			if (e == NULL) {
+				e = calloc(1, sizeof(*e));
+				if (e == NULL) { free(kt); return -ENOMEM; }
+				e->key_tail = strdup(kt);
+				spa_list_append(&impl->meta_entries, &e->link);
+			}
+			free(e->profile_str);
+			e->profile_str = strdup(value);
+			e->profile_set = true;
+			pw_log_info("metadata profile: %s = %s", kt, value);
 		}
 	} else {
-		bool en = spa_atob(value);
-		if (e == NULL) {
-			e = calloc(1, sizeof(*e));
-			if (e == NULL) { free(kt); return -ENOMEM; }
-			e->key_tail = strdup(kt);
-			spa_list_append(&impl->meta_entries, &e->link);
+		if (value == NULL) {
+			if (e && e->enabled_set) {
+				pw_log_info("metadata enabled cleared: %s", kt);
+				e->enabled_set = false;
+			}
+		} else {
+			if (e == NULL) {
+				e = calloc(1, sizeof(*e));
+				if (e == NULL) { free(kt); return -ENOMEM; }
+				e->key_tail = strdup(kt);
+				spa_list_append(&impl->meta_entries, &e->link);
+			}
+			e->enabled_set = true;
+			e->enabled = spa_atob(value);
+			pw_log_info("metadata enabled: %s = %s", kt,
+				    e->enabled ? "true" : "false");
 		}
-		e->enabled = en;
-		pw_log_info("metadata: %s = %s", kt, en ? "true" : "false");
 	}
 
-	/* Now split kt = "peer_host.card_name" and re-evaluate the card. */
+	if (e && !e->enabled_set && !e->profile_set)
+		meta_entry_free(e);
+
 	*dot = '\0';
 	const char *peer_host = kt;
 	const char *card_name = dot + 1;
 	struct peer_card *c = find_card(impl, peer_host, card_name);
-	if (c != NULL)
-		card_apply_state(c);
+	if (c != NULL) {
+		if (is_profile_key && c->device) {
+			int dirs = stored_profile(impl, peer_host, card_name);
+			if (dirs >= 0)
+				peer_device_set_active_dirs(c->device,
+							    (uint32_t) dirs);
+		} else {
+			card_apply_state(c);
+		}
+	}
 
 	free(kt);
 	return 0;
