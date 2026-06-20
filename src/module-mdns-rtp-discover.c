@@ -95,6 +95,15 @@ struct tunnel {
 	struct pw_impl_module *rtp_mod;
 	struct spa_hook rtp_mod_listener;
 
+	/* Auto-reconnect: the rtp child module destroys itself when its
+	 * pw_stream errors out (e.g. graph re-negotiation triggered by a
+	 * Bluetooth headset connect/disconnect — module-rtp-sink.c:215). The
+	 * peer_device profile still shows this direction active, so without a
+	 * reload the playback/capture node silently vanishes from pavucontrol
+	 * until the user toggles the profile. Armed by rtp_mod_destroyed,
+	 * cancelled on deliberate unload / teardown. */
+	struct spa_source *reload_timer;
+
 	/* On-demand input: track the local virtual mic node created by
 	 * libpipewire-module-rtp-source so we only publish the back-channel
 	 * Avahi request while an application is actually consuming audio
@@ -351,8 +360,19 @@ static char *sanitize_for_node_name(const char *s)
 
 /* -- child module loading --------------------------------------------- */
 
+static void tunnel_cancel_reload(struct tunnel *t)
+{
+	struct impl *impl = t->card ? t->card->impl : NULL;
+	if (t->reload_timer && impl) {
+		pw_loop_destroy_source(impl->loop, t->reload_timer);
+		t->reload_timer = NULL;
+	}
+}
+
 static void unload_local_endpoint(struct tunnel *t)
 {
+	/* A deliberate unload supersedes any pending auto-reconnect. */
+	tunnel_cancel_reload(t);
 	/* Drop the local_node listener BEFORE destroying the rtp module —
 	 * pw_impl_module_destroy tears down the stream's impl-node, which
 	 * would fire local_node_destroyed at us anyway, but doing it here
@@ -676,11 +696,60 @@ static void card_apply_state(struct peer_card *c)
 	}
 }
 
+/* Does the active profile still want this tunnel's direction loaded? */
+static bool tunnel_wanted(struct tunnel *t)
+{
+	if (t->card == NULL || t->card->device == NULL)
+		return false;
+	uint32_t active = peer_device_get_active_dirs(t->card->device);
+	uint32_t need = t->is_sink_mode ? PEER_DIR_OUTPUT : PEER_DIR_INPUT;
+	return (active & need) != 0;
+}
+
+static void tunnel_reload_timer_cb(void *data, uint64_t expirations SPA_UNUSED)
+{
+	struct tunnel *t = data;
+	tunnel_cancel_reload(t);
+	/* Re-check: the user may have switched the profile off during the
+	 * backoff window, or BROWSER_REMOVE may have torn the peer down. */
+	if (t->rtp_mod == NULL && t->peer_addr && tunnel_wanted(t)) {
+		pw_log_info("auto-reconnect: reloading rtp child for '%s'",
+			    t->avahi_name);
+		tunnel_set_loaded(t, true);
+		if (t->card)
+			card_update_request(t->card);
+	}
+}
+
+static void tunnel_arm_reload(struct tunnel *t)
+{
+	struct impl *impl = t->card ? t->card->impl : NULL;
+	if (impl == NULL || t->reload_timer != NULL)
+		return;
+	t->reload_timer = pw_loop_add_timer(impl->loop, tunnel_reload_timer_cb, t);
+	if (t->reload_timer == NULL)
+		return;
+	/* Fixed 2s backoff — long enough to ride out a graph re-negotiation
+	 * (BT profile switch) without hammering reload on a persistently
+	 * failing peer. A truly gone peer is cleaned up by BROWSER_REMOVE. */
+	struct timespec v = { .tv_sec = 2, .tv_nsec = 0 };
+	pw_loop_update_timer(impl->loop, t->reload_timer, &v, NULL, false);
+}
+
 static void rtp_mod_destroyed(void *data)
 {
 	struct tunnel *t = data;
 	spa_hook_remove(&t->rtp_mod_listener);
 	t->rtp_mod = NULL;
+	/* We only reach here on an UNEXPECTED death — the deliberate unload
+	 * path (unload_local_endpoint) removes this listener first. If the
+	 * profile still wants this direction, schedule an auto-reconnect so
+	 * the node doesn't silently disappear from pavucontrol. */
+	if (tunnel_wanted(t)) {
+		pw_log_info("rtp child for '%s' died unexpectedly — "
+			    "auto-reconnect armed (2s)", t->avahi_name);
+		tunnel_arm_reload(t);
+	}
 }
 
 static const struct pw_impl_module_events rtp_mod_events = {
@@ -1145,6 +1214,9 @@ static void peer_card_free(struct peer_card *c)
 	card_withdraw_request(c);
 	struct tunnel *t;
 	spa_list_consume(t, &c->tunnels, link) {
+		/* Cancel any armed reload BEFORE detaching the card — the
+		 * cancel helper reaches the loop via t->card->impl. */
+		tunnel_cancel_reload(t);
 		t->card = NULL;          /* prevent recursion via tunnel_free */
 		spa_list_remove(&t->impl_link);
 		unload_local_endpoint(t);
